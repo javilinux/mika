@@ -6,15 +6,25 @@ settings,language,es-ES,yes,20
 settings,use_google_search,false,yes,30
 settings,max_answer_seconds,35,yes,40
 settings,response_timeout_seconds,90,yes,45
-settings,conversation_memory_enabled,true,yes,46
-settings,conversation_timeout_seconds,180,yes,47
-settings,conversation_max_turns,6,yes,48
-settings,idle_timeout_seconds,90,yes,50
+settings,hot_session_enabled,true,yes,46
+settings,hot_session_idle_timeout_seconds,90,yes,47
+settings,hot_session_max_age_seconds,600,yes,48
+settings,hot_session_max_turns,6,yes,49
+settings,conversation_memory_enabled,true,yes,50
+settings,conversation_timeout_seconds,180,yes,51
+settings,conversation_max_turns,6,yes,52
+settings,idle_timeout_seconds,90,yes,55
 settings,max_prompt_bytes,12000,yes,60
 settings,start_trigger,touch,yes,70
 settings,audio_mode,turn_based_half_duplex,yes,80
 settings,playback_mode,i2s,yes,85
+settings,thinking_sfx_enabled,true,yes,86
+settings,thinking_sfx_chance_percent,25,yes,87
+settings,thinking_sfx_delay_ms,1300,yes,88
+settings,thinking_sfx_min_interval_seconds,12,yes,89
 settings,enable_robot_tools,true,yes,90
+settings,gemini_robot_tools_enabled,false,yes,91
+settings,imu_reactions_enabled,true,yes,95
 prompt,identity,"Eres StackChan, el robot anfitrion de yisec Malaga, el Google Safety Engineering Center de Malaga.",yes,100
 prompt,mission,"Tu mision es recibir visitantes, familias y colegios, explicar que se hace aqui y ensenar conceptos basicos de ciberseguridad.",yes,110
 prompt,voice_style,"Habla en espanol con frases cortas, naturales y faciles de entender en voz alta. Se simpatico, curioso y un poco divertido.",yes,120

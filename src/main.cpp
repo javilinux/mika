@@ -3,11 +3,16 @@
 #include <HTTPClient.h>
 #include <LittleFS.h>
 #include <M5StackChan.h>
+#include <M5UnitUnified.h>
+#include <M5UnitUnifiedNFC.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <algorithm>
 #include <driver/i2s.h>
 #include <esp_heap_caps.h>
+#include <esp_camera.h>
+#include <esp_system.h>
+#include <img_converters.h>
 #include <mbedtls/base64.h>
 #include <ctype.h>
 #include <math.h>
@@ -32,15 +37,28 @@ constexpr uint32_t kMicNoSpeechTimeoutMs = 3500;
 constexpr uint32_t kMicSpeechAvgThreshold = 900;
 constexpr uint32_t kMicSilenceAvgThreshold = 550;
 constexpr uint32_t kLiveFirstResponseTimeoutMs = 18000;
-constexpr uint32_t kLivePostAudioSilenceMs = 1800;
+constexpr uint32_t kLivePostAudioSilenceMs = 7000;
 constexpr uint32_t kTouchRestartCooldownMs = 900;
 constexpr uint32_t kTouchStartHoldMs = 140;
 constexpr uint32_t kTouchReleaseDebounceMs = 240;
 constexpr uint32_t kTouchReleaseConfirmMs = 220;
+constexpr uint32_t kMicStopTapArmReleaseMs = 450;
+constexpr uint32_t kMicStopTapHoldMs = 140;
+constexpr uint32_t kMicStopTapTailMs = 420;
+constexpr uint32_t kMicStopTapQuietTailMs = 260;
+constexpr uint32_t kMicStopTapMinTailMs = 180;
 constexpr uint32_t kScreenCheekTouchCooldownMs = 900;
 constexpr bool kTouchBargeInEnabled = false;
 constexpr uint32_t kBargeInArmReleaseMs = 180;
 constexpr uint32_t kBargeInHoldMs = 300;
+constexpr uint32_t kImuSampleIntervalMs = 50;
+constexpr uint32_t kImuBaselineHoldMs = 1100;
+constexpr uint32_t kImuReactionCooldownMs = 2600;
+constexpr uint32_t kImuTiltHoldMs = 260;
+constexpr float kImuShakeAccelDeltaG = 0.48f;
+constexpr float kImuShakeGyroDps = 430.0f;
+constexpr float kImuTiltTriggerDeg = 22.0f;
+constexpr float kImuTiltResetDeg = 12.0f;
 constexpr bool kVisualFaceEnabled = true;
 constexpr bool kServoGesturesEnabled = true;
 constexpr const char* kLocalTimezoneName = "Europe/Madrid";
@@ -52,22 +70,49 @@ constexpr int kServoYawThinking = -50;
 constexpr int kServoPitchThinking = 120;
 constexpr int kServoPitchError = 60;
 constexpr int kServoGestureSpeed = 180;
+constexpr uint16_t kTopTouchIntensityThreshold = 8;
+constexpr uint8_t kMicMagnification = 8;
 constexpr size_t kAudioChunkSamples = 320;  // 20 ms at 16 kHz.
 constexpr size_t kMicStreamChunkSamples = 640;  // 40 ms at 16 kHz.
 constexpr size_t kMicPrerollMaxSamples = static_cast<size_t>(kMicSampleRate) * kMicMaxRecordMs / 1000;
+constexpr bool kMicDirectionDiagnosticsEnabled = false;
+constexpr int32_t kMicDirectionDeadzonePermille = 120;
+constexpr bool kNfcDiagnosticsEnabled = false;
+constexpr uint32_t kNfcPollIntervalMs = 350;
+constexpr uint32_t kNfcDetectTimeoutMs = 45;
+constexpr uint8_t kLtr553I2cAddr = 0x23;
+constexpr uint32_t kAmbientPollIntervalMs = 650;
+constexpr uint32_t kAmbientReactionCooldownMs = 4500;
+constexpr uint32_t kAmbientLogIntervalMs = 10000;
+constexpr bool kAmbientPresenceEnabled = false;
+constexpr uint32_t kIdlePresenceSfxCooldownMs = 24000;
+constexpr uint32_t kDangerSfxCooldownMs = 10000;
+constexpr uint32_t kComplimentEasterEggCooldownMs = 12000;
+constexpr uint32_t kChiquitoEasterEggCooldownMs = 24000;
 constexpr size_t kPlaybackBufferSamples = 24000;  // 1 s at 24 kHz.
 constexpr uint32_t kOutputSampleRate = 24000;
 constexpr size_t kPlaybackPrebufferMinSamples = kOutputSampleRate * 2;  // 2 s.
-constexpr size_t kPlaybackPrebufferInitialSamples = kOutputSampleRate * 3;  // 3 s.
-constexpr size_t kPlaybackPrebufferMaxSamples = kOutputSampleRate * 6;  // 6 s.
-constexpr size_t kPlaybackPrebufferStepSamples = kOutputSampleRate;  // 1 s.
+constexpr size_t kPlaybackPrebufferInitialSamples = kOutputSampleRate * 2;  // 2 s.
+constexpr size_t kPlaybackPrebufferMaxSamples = kOutputSampleRate * 4;  // 4 s.
+constexpr size_t kPlaybackPrebufferStepSamples = kOutputSampleRate / 2;  // 0.5 s.
 constexpr size_t kPlaybackPrebufferTrimSamples = kOutputSampleRate / 2;  // 0.5 s.
+constexpr uint32_t kDynamicPrebufferMinMs = 900;
+constexpr uint32_t kDynamicPrebufferMaxMs = 3000;
+constexpr uint32_t kDynamicPrebufferMinObserveMs = 250;
 constexpr size_t kI2sChannels = 2;
 constexpr size_t kI2sWriteFrames = 480;  // 20 ms at 24 kHz.
 constexpr size_t kI2sWriteWords = kI2sWriteFrames * kI2sChannels;
 constexpr size_t kI2sRingFrames = kOutputSampleRate * 8;  // 8 s of stereo PCM.
 constexpr size_t kI2sRingWords = kI2sRingFrames * kI2sChannels;
 constexpr size_t kMaxLocalSfxBytes = 1024 * 1024;
+constexpr uint32_t kThinkingSfxDefaultDelayMs = 1300;
+constexpr uint32_t kThinkingSfxDefaultMinIntervalMs = 12000;
+constexpr int kThinkingSfxDefaultChancePercent = 25;
+constexpr size_t kMaxCapturedJpegBytes = 256 * 1024;
+constexpr size_t kMaxGenerateResponseBytes = 4 * 1024 * 1024;
+constexpr const char* kPhotoCapturePath = "/camera_capture.jpg";
+constexpr const char* kPhotoResultPath = "/camera_result.img";
+constexpr const char* kPhotoEditDefaultStyle = "poster de ciberseguridad colorido, amigable y futurista";
 constexpr uint8_t kAw88298I2cAddr = 0x36;
 constexpr uint8_t kAw9523I2cAddr = 0x58;
 constexpr bool kVerboseWssFrames = false;
@@ -99,11 +144,24 @@ struct RuntimeConfig {
     String playbackMode = "i2s";
     bool useGoogleSearch = false;
     bool enableRobotTools = true;
+    bool geminiRobotToolsEnabled = false;
+    bool imuReactionsEnabled = true;
+    bool imageEditEnabled = false;
+    bool thinkingSfxEnabled = true;
+    int thinkingSfxChancePercent = kThinkingSfxDefaultChancePercent;
+    int thinkingSfxDelayMs = kThinkingSfxDefaultDelayMs;
+    int thinkingSfxMinIntervalSeconds = kThinkingSfxDefaultMinIntervalMs / 1000;
+    String visionDescriptionModel = "gemini-3-flash-preview";
+    String imageEditModel = "gemini-2.5-flash-image";
     bool conversationMemoryEnabled = true;
     int maxAnswerSeconds = 25;
     int responseTimeoutSeconds = 90;
     int conversationTimeoutSeconds = 180;
     int conversationMaxTurns = 6;
+    bool hotSessionEnabled = true;
+    int hotSessionIdleTimeoutSeconds = 90;
+    int hotSessionMaxAgeSeconds = 600;
+    int hotSessionMaxTurns = 6;
     String systemPrompt;
 };
 
@@ -224,6 +282,22 @@ struct LiveResponseResult {
     String outputTranscript;
     bool turnComplete = false;
     bool interruptedByBargeIn = false;
+    bool photoRequest = false;
+};
+
+struct VoiceLatencyTrace {
+    bool stopTapUsed = false;
+    uint32_t stopTapRequestedAt = 0;
+    uint32_t activityEndSentAt = 0;
+    uint32_t responseWaitStartedAt = 0;
+    uint32_t firstAudioAt = 0;
+    uint32_t playbackStartedAt = 0;
+    uint32_t adaptiveTailMs = 0;
+};
+
+enum class PhotoWorkflowState {
+    Idle,
+    AwaitingStyle,
 };
 
 enum class VisualState {
@@ -243,6 +317,7 @@ enum class VisualExpression {
     Surprised,
     Sad,
     Angry,
+    Dizzy,
 };
 
 enum class ContentGesture {
@@ -258,6 +333,32 @@ enum class LocalSfx {
     Happy,
     Giggle,
     Dance,
+    GiggleSoft,
+    GiggleBright,
+    AckAha,
+    AckMhm,
+    SurpriseOoh,
+    SurpriseGasp,
+    SadAww,
+    ReliefPhew,
+    ConfusedHuh,
+    Tada,
+    ThinkingMmm,
+    ThinkingHmm,
+    ThinkingMmmSoft,
+    ThinkingMmmRise,
+    ThinkingMmmShort,
+    ThinkingHmmSoft,
+    ChiquitoGrito,
+    ChiquitoEpetekan,
+    DizzyMareao,
+    DizzyMeneito,
+    DizzyBits,
+    DizzyFirewalls,
+    TiltCuidao,
+    TiltDerechito,
+    TiltWifi,
+    TiltDesconfiguro,
 };
 
 volatile uint8_t gPlaybackMouthLevel = 0;
@@ -343,6 +444,23 @@ public:
         update(true);
     }
 
+    void suspendDrawingFor(uint32_t durationMs)
+    {
+        if (!ready) {
+            return;
+        }
+        drawingSuspendedUntil = millis() + durationMs;
+    }
+
+    void resumeDrawing()
+    {
+        if (!ready) {
+            return;
+        }
+        drawingSuspendedUntil = 0;
+        update(true);
+    }
+
     void pokeEye(int8_t side)
     {
         if (!ready || side == 0) {
@@ -374,6 +492,13 @@ public:
             return;
         }
         uint32_t now = millis();
+        if (drawingSuspendedUntil != 0 && now < drawingSuspendedUntil) {
+            return;
+        }
+        if (drawingSuspendedUntil != 0 && now >= drawingSuspendedUntil) {
+            drawingSuspendedUntil = 0;
+            force = true;
+        }
         if (temporaryExpressionActive && now >= temporaryExpressionUntil) {
             temporaryExpressionActive = false;
             expression = defaultExpressionForState(state);
@@ -403,6 +528,7 @@ private:
     uint32_t squintEyeUntil = 0;
     uint32_t stateChangedAt = 0;
     uint32_t lastDrawAt = 0;
+    uint32_t drawingSuspendedUntil = 0;
     uint32_t palomaOverlayUntil = 0;
     uint32_t rngState = 0;
     uint32_t nextBlinkAt = 0;
@@ -613,6 +739,11 @@ private:
         int r = face == VisualExpression::Surprised ? 15 : 11;
         int x = cx + static_cast<int>(gazeX * 3.0f);
         int y = cy + static_cast<int>(gazeY * 3.0f);
+        if (face == VisualExpression::Dizzy) {
+            drawThickLine(x - 14, y - 14, x + 14, y + 14, primary);
+            drawThickLine(x - 14, y + 14, x + 14, y - 14, primary);
+            return;
+        }
         if (open <= 0.18f) {
             canvas->fillRect(x - r, y - 2, r * 2, 4, primary);
             return;
@@ -663,6 +794,10 @@ private:
         } else if (expression == VisualExpression::Sad) {
             drawThickLine(74, eyeY - 14, 108, eyeY - 24, TFT_WHITE);
             drawThickLine(212, eyeY - 24, 246, eyeY - 14, TFT_WHITE);
+        } else if (expression == VisualExpression::Dizzy) {
+            canvas->drawCircle(156, eyeY - 38, 6, TFT_WHITE);
+            canvas->drawCircle(166, eyeY - 43, 4, TFT_WHITE);
+            canvas->fillCircle(176, eyeY - 42, 2, TFT_WHITE);
         }
     }
 
@@ -684,6 +819,11 @@ private:
             canvas->fillRect(cx - 22, y - 2, 44, 4, primary);
         } else if (state == VisualState::Error) {
             drawThickLine(cx - 24, y + 7, cx + 24, y - 3, primary);
+        } else if (expression == VisualExpression::Dizzy) {
+            drawThickLine(cx - 34, y + 2, cx - 18, y - 3, primary);
+            drawThickLine(cx - 18, y - 3, cx - 2, y + 3, primary);
+            drawThickLine(cx - 2, y + 3, cx + 16, y - 3, primary);
+            drawThickLine(cx + 16, y - 3, cx + 34, y + 2, primary);
         } else if (expression == VisualExpression::Happy) {
             drawThickLine(cx - 38, y - 1, cx - 12, y + 3, primary);
             canvas->fillRect(cx - 12, y + 2, 24, 4, primary);
@@ -897,6 +1037,27 @@ public:
         moveTo(kServoYawCenter, kServoPitchCenter - 45, 260);
     }
 
+    void performDizzyReaction()
+    {
+        if (!ready || activeSequence != nullptr) {
+            return;
+        }
+        startSequence(dizzyWobble, sizeof(dizzyWobble) / sizeof(dizzyWobble[0]), false);
+    }
+
+    void performTiltComplaint(int8_t side)
+    {
+        if (!ready || activeSequence != nullptr) {
+            return;
+        }
+        uint32_t now = millis();
+        pendingReturnAt = now + 720;
+        if (side == 0) {
+            side = 1;
+        }
+        moveTo(side < 0 ? -90 : 90, kServoPitchCenter - 35, 240);
+    }
+
     void performPalomaEasterEgg()
     {
         if (!ready || activeSequence != nullptr) {
@@ -905,6 +1066,38 @@ public:
         uint32_t now = millis();
         pendingReturnAt = now + 1200;
         moveTo(-80, kServoPitchCenter + 45, 180);
+    }
+
+    bool performChiquitoEasterEgg()
+    {
+        if (!ready || activeSequence != nullptr) {
+            return false;
+        }
+        return startSequence(chiquitoPrelude, sizeof(chiquitoPrelude) / sizeof(chiquitoPrelude[0]), false);
+    }
+
+    void forceCenter(uint32_t speed = kServoGestureSpeed)
+    {
+        if (!ready) {
+            return;
+        }
+        clearActiveSequence();
+        pendingReturnAt = 0;
+        moveTo(kServoYawCenter, kServoPitchCenter, speed);
+    }
+
+    void performPresenceNotice()
+    {
+        if (!ready || activeSequence != nullptr || pendingReturnAt > 0) {
+            return;
+        }
+        uint32_t now = millis();
+        if (now - lastPresenceNoticeAt < 5500) {
+            return;
+        }
+        lastPresenceNoticeAt = now;
+        pendingReturnAt = now + 560;
+        moveTo(kServoYawCenter, kServoPitchCenter + 35, 180);
     }
 
     bool startOfficialDance()
@@ -919,6 +1112,11 @@ public:
     bool isDancing() const
     {
         return activeSequence != nullptr && activeSequenceIsDance;
+    }
+
+    bool isBusy() const
+    {
+        return activeSequence != nullptr || pendingReturnAt > 0;
     }
 
 private:
@@ -959,6 +1157,24 @@ private:
         {0, 0, 500, 500},
     };
 
+    static constexpr DanceFrame dizzyWobble[] = {
+        {130, 70, 520, 130},
+        {-130, 95, 520, 130},
+        {110, 70, 520, 130},
+        {-110, 95, 520, 130},
+        {0, 80, 360, 420},
+    };
+
+    static constexpr DanceFrame chiquitoPrelude[] = {
+        {760, 650, 900, 180},
+        {-760, 70, 900, 180},
+        {620, 760, 900, 170},
+        {-620, 40, 900, 170},
+        {820, 460, 900, 160},
+        {-820, 180, 900, 160},
+        {0, 80, 720, 320},
+    };
+
     bool ready = false;
     VisualState lastState = VisualState::Boot;
     uint32_t lastGestureAt = 0;
@@ -967,6 +1183,7 @@ private:
     uint32_t lastEyePokeAt = 0;
     uint32_t lastMouthTouchAt = 0;
     uint32_t lastDanceAt = 0;
+    uint32_t lastPresenceNoticeAt = 0;
     uint32_t pendingReturnAt = 0;
     const DanceFrame* activeSequence = nullptr;
     size_t activeSequenceCount = 0;
@@ -1033,17 +1250,526 @@ private:
     }
 };
 
+enum class ImuReactionType {
+    None,
+    Shake,
+    Tilt,
+};
+
+struct ImuReactionEvent {
+    ImuReactionType type = ImuReactionType::None;
+    float amount = 0.0f;
+    int8_t side = 0;
+};
+
+class ImuReactionDetector {
+public:
+    bool begin()
+    {
+        ready = M5.Imu.isEnabled();
+        lastSampleAt = millis();
+        return ready;
+    }
+
+    bool isReady() const
+    {
+        return ready;
+    }
+
+    void recalibrate(uint32_t cooldownMs)
+    {
+        sampleReady = false;
+        baselineReady = false;
+        stableBaselineSince = 0;
+        tiltCandidateSince = 0;
+        tiltArmed = true;
+        cooldownUntil = millis() + cooldownMs;
+    }
+
+    ImuReactionEvent update(bool allowReaction)
+    {
+        ImuReactionEvent event;
+        if (!ready) {
+            return event;
+        }
+
+        uint32_t now = millis();
+        if (now - lastSampleAt < kImuSampleIntervalMs) {
+            return event;
+        }
+        lastSampleAt = now;
+
+        float ax = 0.0f;
+        float ay = 0.0f;
+        float az = 0.0f;
+        if (!M5.Imu.getAccel(&ax, &ay, &az)) {
+            return event;
+        }
+
+        float gx = 0.0f;
+        float gy = 0.0f;
+        float gz = 0.0f;
+        M5.Imu.getGyro(&gx, &gy, &gz);
+
+        if (!sampleReady) {
+            filteredX = ax;
+            filteredY = ay;
+            filteredZ = az;
+            sampleReady = true;
+            stableBaselineSince = 0;
+            return event;
+        }
+
+        float accelDelta = vectorMag(ax - filteredX, ay - filteredY, az - filteredZ);
+        float gyroMag = vectorMag(gx, gy, gz);
+
+        constexpr float alpha = 0.22f;
+        filteredX += (ax - filteredX) * alpha;
+        filteredY += (ay - filteredY) * alpha;
+        filteredZ += (az - filteredZ) * alpha;
+
+        if (!baselineReady) {
+            if (accelDelta < 0.10f && gyroMag < 30.0f) {
+                if (stableBaselineSince == 0) {
+                    stableBaselineSince = now;
+                } else if (now - stableBaselineSince >= kImuBaselineHoldMs) {
+                    initBaselineFromFiltered();
+                    baselineReady = true;
+                    cooldownUntil = now + 900;
+                }
+            } else {
+                stableBaselineSince = 0;
+            }
+            return event;
+        }
+
+        float nx = filteredX;
+        float ny = filteredY;
+        float nz = filteredZ;
+        if (!normalize(nx, ny, nz)) {
+            return event;
+        }
+
+        float angleDeg = tiltAngleDeg(nx, ny, nz);
+        bool quiet = accelDelta < 0.16f && gyroMag < 45.0f;
+        if (quiet && angleDeg < 12.0f) {
+            adaptBaseline(nx, ny, nz);
+        }
+
+        if (angleDeg < kImuTiltResetDeg) {
+            tiltCandidateSince = 0;
+            tiltArmed = true;
+        }
+
+        if (!allowReaction || now < cooldownUntil) {
+            return event;
+        }
+
+        if (accelDelta >= kImuShakeAccelDeltaG || gyroMag >= kImuShakeGyroDps) {
+            cooldownUntil = now + kImuReactionCooldownMs;
+            tiltCandidateSince = 0;
+            tiltArmed = false;
+            event.type = ImuReactionType::Shake;
+            event.amount = std::max(accelDelta, gyroMag / kImuShakeGyroDps);
+            return event;
+        }
+
+        if (tiltArmed && angleDeg >= kImuTiltTriggerDeg) {
+            if (tiltCandidateSince == 0) {
+                tiltCandidateSince = now;
+                return event;
+            }
+            if (now - tiltCandidateSince >= kImuTiltHoldMs) {
+                cooldownUntil = now + kImuReactionCooldownMs;
+                tiltArmed = false;
+                tiltCandidateSince = 0;
+                event.type = ImuReactionType::Tilt;
+                event.amount = angleDeg;
+                event.side = dominantTiltSide(nx, ny);
+            }
+        } else {
+            tiltCandidateSince = 0;
+        }
+
+        return event;
+    }
+
+private:
+    bool ready = false;
+    bool sampleReady = false;
+    bool baselineReady = false;
+    bool tiltArmed = true;
+    uint32_t lastSampleAt = 0;
+    uint32_t cooldownUntil = 0;
+    uint32_t stableBaselineSince = 0;
+    uint32_t tiltCandidateSince = 0;
+    float filteredX = 0.0f;
+    float filteredY = 0.0f;
+    float filteredZ = 1.0f;
+    float baselineX = 0.0f;
+    float baselineY = 0.0f;
+    float baselineZ = 1.0f;
+
+    static float vectorMag(float x, float y, float z)
+    {
+        return sqrtf(x * x + y * y + z * z);
+    }
+
+    static float clampFloat(float value, float minValue, float maxValue)
+    {
+        if (value < minValue) {
+            return minValue;
+        }
+        if (value > maxValue) {
+            return maxValue;
+        }
+        return value;
+    }
+
+    static bool normalize(float& x, float& y, float& z)
+    {
+        float mag = vectorMag(x, y, z);
+        if (mag < 0.1f) {
+            return false;
+        }
+        x /= mag;
+        y /= mag;
+        z /= mag;
+        return true;
+    }
+
+    void initBaselineFromFiltered()
+    {
+        baselineX = filteredX;
+        baselineY = filteredY;
+        baselineZ = filteredZ;
+        normalize(baselineX, baselineY, baselineZ);
+    }
+
+    float tiltAngleDeg(float nx, float ny, float nz) const
+    {
+        float dot = clampFloat(nx * baselineX + ny * baselineY + nz * baselineZ, -1.0f, 1.0f);
+        return acosf(dot) * 57.2957795f;
+    }
+
+    void adaptBaseline(float nx, float ny, float nz)
+    {
+        baselineX = baselineX * 0.996f + nx * 0.004f;
+        baselineY = baselineY * 0.996f + ny * 0.004f;
+        baselineZ = baselineZ * 0.996f + nz * 0.004f;
+        normalize(baselineX, baselineY, baselineZ);
+    }
+
+    int8_t dominantTiltSide(float nx, float ny) const
+    {
+        float dx = nx - baselineX;
+        float dy = ny - baselineY;
+        float dominant = fabsf(dx) >= fabsf(dy) ? dx : dy;
+        if (dominant > 0.08f) {
+            return 1;
+        }
+        if (dominant < -0.08f) {
+            return -1;
+        }
+        return 0;
+    }
+};
+
+void logLine(const String& line);
+void setStatusColor(uint8_t r, uint8_t g, uint8_t b);
+bool requestLocalSfxThrottled(LocalSfx sfx, uint32_t& nextAllowedAt, uint32_t cooldownMs);
+extern VisualEngine gVisual;
+extern RobotGestures gGestures;
+extern uint32_t gNextIdlePresenceSfxAllowedAt;
+
+struct AmbientSample {
+    uint16_t proximity = 0;
+    uint16_t alsCh0 = 0;
+    uint16_t alsCh1 = 0;
+    uint8_t status = 0;
+};
+
+enum class AmbientState {
+    Normal,
+    Near,
+    Dark,
+    Bright,
+    Covered,
+};
+
+class AmbientPresenceService {
+public:
+    bool begin()
+    {
+        if (!M5.In_I2C.scanID(kLtr553I2cAddr, 400000)) {
+            logLine("WARN LTR553 not found");
+            return false;
+        }
+
+        uint8_t part = 0;
+        uint8_t manufacturer = 0;
+        if (!read8(0x86, part) || !read8(0x87, manufacturer)) {
+            logLine("WARN LTR553 id read failed");
+            return false;
+        }
+
+        bool ok = true;
+        ok = write8(0x80, 0x01) && ok;  // ALS active, gain x1.
+        ok = write8(0x81, 0x0F) && ok;  // PS active, gain x64 for earlier presence reactions.
+        ok = write8(0x82, 0x7F) && ok;  // 60 kHz, 100% duty, 100 mA peak.
+        ok = write8(0x83, 0x04) && ok;  // A few LED pulses for stable proximity.
+        ok = write8(0x84, 0x02) && ok;  // Default-ish PS measurement rate.
+        ok = write8(0x85, 0x03) && ok;  // Default ALS integration/rate.
+        if (!ok) {
+            logLine("WARN LTR553 init write failed");
+            return false;
+        }
+
+        ready = true;
+        nextPollAt = millis() + 250;
+        logLine(String("OK LTR553 ambient part/manuf: 0x") +
+                String(part, HEX) + "/0x" + String(manufacturer, HEX));
+        return true;
+    }
+
+    void update(bool allowed)
+    {
+        if (!ready || !allowed) {
+            return;
+        }
+
+        uint32_t now = millis();
+        if (now < nextPollAt) {
+            return;
+        }
+        nextPollAt = now + kAmbientPollIntervalMs;
+
+        AmbientSample sample;
+        if (!readSample(sample)) {
+            if (now - lastLogAt >= kAmbientLogIntervalMs) {
+                logLine("WARN LTR553 sample read failed");
+                lastLogAt = now;
+            }
+            return;
+        }
+
+        updateBaselines(sample);
+        AmbientState next = classify(sample);
+        if (next != state) {
+            ++candidateCount;
+            if (candidateState != next) {
+                candidateState = next;
+                candidateCount = 1;
+            }
+        } else {
+            candidateState = state;
+            candidateCount = 0;
+        }
+
+        if (candidateCount >= 2) {
+            applyState(candidateState, sample, now);
+            candidateCount = 0;
+        } else if (now - lastLogAt >= kAmbientLogIntervalMs) {
+            logSample("Ambient", sample);
+            lastLogAt = now;
+        }
+    }
+
+    bool isReady() const
+    {
+        return ready;
+    }
+
+private:
+    bool read8(uint8_t reg, uint8_t& value)
+    {
+        return M5.In_I2C.readRegister(kLtr553I2cAddr, reg, &value, 1, 400000);
+    }
+
+    bool write8(uint8_t reg, uint8_t value)
+    {
+        return M5.In_I2C.writeRegister8(kLtr553I2cAddr, reg, value, 400000);
+    }
+
+    bool readSample(AmbientSample& sample)
+    {
+        uint8_t data[7] = {};
+        if (!M5.In_I2C.readRegister(kLtr553I2cAddr, 0x88, data, sizeof(data), 400000)) {
+            return false;
+        }
+        sample.alsCh1 = static_cast<uint16_t>(data[0] | (data[1] << 8));
+        sample.alsCh0 = static_cast<uint16_t>(data[2] | (data[3] << 8));
+        sample.status = data[4];
+        sample.proximity = static_cast<uint16_t>(data[5] | ((data[6] & 0x07) << 8));
+        return true;
+    }
+
+    void updateBaselines(const AmbientSample& sample)
+    {
+        if (!baselineReady) {
+            psBaseline = sample.proximity;
+            lightBaseline = std::max<uint32_t>(sample.alsCh0, 1);
+            baselineReady = true;
+            return;
+        }
+
+        bool near = isNear(sample);
+        bool lightExtreme = isDark(sample) || isBright(sample);
+        if (!near && sample.proximity <= static_cast<uint32_t>(psBaseline) + 25) {
+            psBaseline = static_cast<uint16_t>((static_cast<uint32_t>(psBaseline) * 31 + sample.proximity) / 32);
+        }
+        if (!lightExtreme && sample.alsCh0 > 0) {
+            lightBaseline = (lightBaseline * 31 + sample.alsCh0) / 32;
+            lightBaseline = std::max<uint32_t>(lightBaseline, 1);
+        }
+    }
+
+    bool isNear(const AmbientSample& sample) const
+    {
+        uint32_t onThreshold = std::max<uint32_t>(55, static_cast<uint32_t>(psBaseline) + 45);
+        uint32_t offThreshold = std::max<uint32_t>(38, static_cast<uint32_t>(psBaseline) + 24);
+        return state == AmbientState::Near || state == AmbientState::Covered
+                   ? sample.proximity > offThreshold
+                   : sample.proximity > onThreshold;
+    }
+
+    bool isDark(const AmbientSample& sample) const
+    {
+        if (lightBaseline < 20) {
+            return sample.alsCh0 <= 1;
+        }
+        uint32_t onThreshold = std::max<uint32_t>(8, lightBaseline / 5);
+        uint32_t offThreshold = std::max<uint32_t>(16, lightBaseline / 3);
+        return state == AmbientState::Dark || state == AmbientState::Covered
+                   ? sample.alsCh0 < offThreshold
+                   : sample.alsCh0 < onThreshold;
+    }
+
+    bool isBright(const AmbientSample& sample) const
+    {
+        if (lightBaseline < 20) {
+            return state == AmbientState::Bright ? sample.alsCh0 > 120 : sample.alsCh0 > 220;
+        }
+        uint32_t onThreshold = std::max<uint32_t>(12000, lightBaseline * 3 + 400);
+        uint32_t offThreshold = std::max<uint32_t>(8000, lightBaseline * 2 + 200);
+        return state == AmbientState::Bright ? sample.alsCh0 > offThreshold : sample.alsCh0 > onThreshold;
+    }
+
+    AmbientState classify(const AmbientSample& sample) const
+    {
+        bool near = isNear(sample);
+        bool dark = isDark(sample);
+        if (near && dark) {
+            return AmbientState::Covered;
+        }
+        if (near) {
+            return AmbientState::Near;
+        }
+        if (dark) {
+            return AmbientState::Dark;
+        }
+        if (isBright(sample)) {
+            return AmbientState::Bright;
+        }
+        return AmbientState::Normal;
+    }
+
+    const char* stateName(AmbientState value) const
+    {
+        switch (value) {
+            case AmbientState::Normal:
+                return "normal";
+            case AmbientState::Near:
+                return "near";
+            case AmbientState::Dark:
+                return "dark";
+            case AmbientState::Bright:
+                return "bright";
+            case AmbientState::Covered:
+                return "covered";
+        }
+        return "unknown";
+    }
+
+    void logSample(const char* prefix, const AmbientSample& sample)
+    {
+        logLine(String(prefix) +
+                " ps=" + sample.proximity +
+                " als0=" + sample.alsCh0 +
+                " als1=" + sample.alsCh1 +
+                " base_ps=" + psBaseline +
+                " base_als=" + lightBaseline +
+                " state=" + stateName(state));
+    }
+
+    void applyState(AmbientState next, const AmbientSample& sample, uint32_t now)
+    {
+        state = next;
+        lastLogAt = now;
+        logSample("Ambient state", sample);
+
+        if (now - lastReactionAt < kAmbientReactionCooldownMs && next != AmbientState::Normal) {
+            return;
+        }
+
+        switch (next) {
+            case AmbientState::Near:
+                lastReactionAt = now;
+                gVisual.setExpressionFor(VisualExpression::Happy, 1100);
+                gGestures.performPresenceNotice();
+                requestLocalSfxThrottled(LocalSfx::ThinkingHmmSoft, gNextIdlePresenceSfxAllowedAt, kIdlePresenceSfxCooldownMs);
+                setStatusColor(0, 36, 18);
+                break;
+            case AmbientState::Dark:
+                lastReactionAt = now;
+                gVisual.setExpressionFor(VisualExpression::Sleepy, 1600);
+                setStatusColor(3, 3, 18);
+                break;
+            case AmbientState::Bright:
+                lastReactionAt = now;
+                gVisual.setExpressionFor(VisualExpression::Doubt, 1300);
+                setStatusColor(40, 28, 0);
+                break;
+            case AmbientState::Covered:
+                lastReactionAt = now;
+                gVisual.setExpressionFor(VisualExpression::Surprised, 1300);
+                gGestures.performPresenceNotice();
+                requestLocalSfxThrottled(LocalSfx::ConfusedHuh, gNextIdlePresenceSfxAllowedAt, kIdlePresenceSfxCooldownMs);
+                setStatusColor(36, 18, 0);
+                break;
+            case AmbientState::Normal:
+                setStatusColor(0, 32, 0);
+                break;
+        }
+    }
+
+    bool ready = false;
+    bool baselineReady = false;
+    uint16_t psBaseline = 0;
+    uint32_t lightBaseline = 1;
+    AmbientState state = AmbientState::Normal;
+    AmbientState candidateState = AmbientState::Normal;
+    uint8_t candidateCount = 0;
+    uint32_t nextPollAt = 0;
+    uint32_t lastReactionAt = 0;
+    uint32_t lastLogAt = 0;
+};
+
 Secrets gSecrets;
 RuntimeConfig gRuntimeConfig;
 ConversationManager gConversation;
 VisualEngine gVisual;
 RobotGestures gGestures;
+ImuReactionDetector gImuReactions;
+AmbientPresenceService gAmbientPresence;
+m5::unit::UnitUnified gNfcUnits;
+m5::unit::UnitNFC gNfcUnit;
+m5::nfc::NFCLayerA gNfcLayerA{gNfcUnit};
 bool gReadyForVoice = false;
 bool gTurnRunning = false;
 bool gResponsePlaybackActive = false;
 bool gBargeInRequested = false;
 bool gAutoStartVoiceTurn = false;
-bool gNextTurnTouchReleaseMode = false;
 size_t gAdaptivePrebufferSamples = kPlaybackPrebufferInitialSamples;
 uint8_t gCleanPlaybackTurns = 0;
 bool gTouchLevelStartArmed = true;
@@ -1053,16 +1779,67 @@ uint32_t gTopTouchLastActiveAt = 0;
 uint32_t gNextScreenCheekTouchAllowedAt = 0;
 bool gScreenMouthStopRequested = false;
 uint32_t gNextPalomaEasterEggAllowedAt = 0;
+uint32_t gNextIdlePresenceSfxAllowedAt = 0;
+uint32_t gNextDangerSfxAllowedAt = 0;
+uint32_t gNextComplimentEasterEggAllowedAt = 0;
+uint32_t gNextChiquitoEasterEggAllowedAt = 0;
 LocalSfx gPendingLocalSfx = LocalSfx::None;
+bool gLocalSfxPlaying = false;
+uint32_t gLastThinkingSfxAt = 0;
+PhotoWorkflowState gPhotoWorkflowState = PhotoWorkflowState::Idle;
+bool gPhotoWorkflowBusy = false;
+bool gCameraInitialized = false;
+String gLastVoiceInputTranscript;
+String gLastVoiceOutputTranscript;
+String gPendingPhotoDescription;
+String gLastVisionError;
+bool gLastVisionTransportError = false;
+bool gNfcReady = false;
+uint32_t gNextNfcPollAt = 0;
+String gLastNfcUid;
+uint32_t gLastNfcSeenAt = 0;
+WiFiClientSecure gHotLiveClient;
+bool gHotLiveSessionOpen = false;
+uint32_t gHotLiveOpenedAt = 0;
+uint32_t gHotLiveLastUsedAt = 0;
+uint16_t gHotLiveTurns = 0;
+String gHotLiveConfigKey;
 
 void setStatusColor(uint8_t r, uint8_t g, uint8_t b);
 void serviceRobot();
 void logLine(const String& line);
 void requestLocalSfx(LocalSfx sfx);
+bool requestLocalSfxThrottled(LocalSfx sfx, uint32_t& nextAllowedAt, uint32_t cooldownMs);
+const char* localSfxPath(LocalSfx sfx);
+void playLocalSfx(LocalSfx sfx);
+String generateModelName(String model);
 void processPendingLocalSfx();
+void processImuReactions();
 bool reloadRuntimeConfigFromRemote();
+void closeHotLiveSession(const char* reason);
+void serviceHotLiveSession();
 bool handleScreenMouthTouch(uint32_t now);
 bool maybeTriggerPalomaEasterEgg(String text);
+bool maybeTriggerComplimentEasterEgg(String text);
+bool maybeTriggerChiquitoEasterEgg(String text);
+bool handlePhotoWorkflowAfterVoice(bool voiceOk);
+bool beginNfcDiagnostics();
+void processNfcDiagnostics();
+bool looksLikePhotoRequest(String text);
+bool openGeminiLiveWebSocket(const Secrets& secrets, WiFiClientSecure& client, bool showThinking);
+bool sendLiveSetup(
+    WiFiClientSecure& client,
+    const RuntimeConfig& config,
+    const String& instruction,
+    bool includeInputTranscription,
+    bool manualActivityDetection,
+    bool includeRobotTools);
+bool sendLiveText(WiFiClientSecure& client, const char* text);
+LiveResponseResult collectLiveResponse(
+    WiFiClientSecure& client,
+    uint32_t timeoutMs,
+    const RuntimeConfig& config,
+    VoiceLatencyTrace* latency = nullptr);
 
 void setRobotState(VisualState state)
 {
@@ -1097,7 +1874,9 @@ bool rawTopTouchActive()
         return true;
     }
     const auto& intensities = M5StackChan.TouchSensor.getIntensities();
-    return intensities[0] > 0 || intensities[1] > 0 || intensities[2] > 0;
+    return intensities[0] >= kTopTouchIntensityThreshold ||
+           intensities[1] >= kTopTouchIntensityThreshold ||
+           intensities[2] >= kTopTouchIntensityThreshold;
 }
 
 bool topTouchActive()
@@ -1108,19 +1887,6 @@ bool topTouchActive()
         return true;
     }
     return gTopTouchLastActiveAt != 0 && now - gTopTouchLastActiveAt <= kTouchReleaseDebounceMs;
-}
-
-bool topTouchActiveDuring(uint32_t windowMs)
-{
-    uint32_t deadline = millis() + windowMs;
-    do {
-        serviceRobot();
-        if (topTouchActive()) {
-            return true;
-        }
-        delay(10);
-    } while (millis() < deadline);
-    return topTouchActive();
 }
 
 bool handleScreenMouthTouch(uint32_t now)
@@ -1149,6 +1915,7 @@ bool handleScreenMouthTouch(uint32_t now)
         gScreenMouthStopRequested = true;
         logLine("Screen mouth touch: stop");
     } else {
+        requestLocalSfx((esp_random() % 2) == 0 ? LocalSfx::SurpriseOoh : LocalSfx::SurpriseGasp);
         logLine("Screen mouth touch");
     }
     return true;
@@ -1173,7 +1940,9 @@ bool handleScreenCheekTouch(uint32_t now)
         if (reloadZone) {
             gNextScreenCheekTouchAllowedAt = now + 1500;
             logLine("Screen config reload");
-            reloadRuntimeConfigFromRemote();
+            if (reloadRuntimeConfigFromRemote()) {
+                requestLocalSfx(LocalSfx::Tada);
+            }
             return true;
         }
 
@@ -1258,9 +2027,22 @@ bool containsAny(const String& text, const char* const* needles, size_t count)
     return false;
 }
 
-bool maybeTriggerPalomaEasterEgg(String text)
+String normalizedTriggerText(String text)
 {
     text.toLowerCase();
+    text.replace("á", "a");
+    text.replace("é", "e");
+    text.replace("í", "i");
+    text.replace("ó", "o");
+    text.replace("ú", "u");
+    text.replace("ü", "u");
+    text.replace("ñ", "n");
+    return text;
+}
+
+bool maybeTriggerPalomaEasterEgg(String text)
+{
+    text = normalizedTriggerText(text);
     if (text.indexOf("paloma") < 0) {
         return false;
     }
@@ -1275,9 +2057,112 @@ bool maybeTriggerPalomaEasterEgg(String text)
     return true;
 }
 
+bool maybeTriggerComplimentEasterEgg(String text)
+{
+    text = normalizedTriggerText(text);
+    static const char* const complimentWords[] = {
+        "mika eres guapa", "mika eres bonita", "mika eres preciosa", "mika eres mona",
+        "que guapa", "que bonita", "que mona", "me caes bien", "eres genial",
+        "te quiero mika", "mika te quiero"
+    };
+    if (!containsAny(text, complimentWords, sizeof(complimentWords) / sizeof(complimentWords[0]))) {
+        return false;
+    }
+    uint32_t now = millis();
+    if (now < gNextComplimentEasterEggAllowedAt) {
+        return false;
+    }
+    gNextComplimentEasterEggAllowedAt = now + kComplimentEasterEggCooldownMs;
+    gVisual.showPalomaEasterEgg();
+    gGestures.performPalomaEasterEgg();
+    requestLocalSfx(LocalSfx::GiggleSoft);
+    logLine("Compliment easter egg");
+    return true;
+}
+
+LocalSfx randomChiquitoSfx()
+{
+    static constexpr LocalSfx kChiquitoSfx[] = {
+        LocalSfx::ChiquitoGrito,
+        LocalSfx::ChiquitoEpetekan,
+    };
+    static LocalSfx lastChiquitoSfx = LocalSfx::None;
+    constexpr size_t count = sizeof(kChiquitoSfx) / sizeof(kChiquitoSfx[0]);
+    size_t index = esp_random() % count;
+    if (count > 1 && kChiquitoSfx[index] == lastChiquitoSfx) {
+        index = (index + 1 + (esp_random() % (count - 1))) % count;
+    }
+    lastChiquitoSfx = kChiquitoSfx[index];
+    return lastChiquitoSfx;
+}
+
+LocalSfx randomDizzySfx()
+{
+    static constexpr LocalSfx kDizzySfx[] = {
+        LocalSfx::DizzyMareao,
+        LocalSfx::DizzyMeneito,
+        LocalSfx::DizzyBits,
+        LocalSfx::DizzyFirewalls,
+    };
+    static LocalSfx lastDizzySfx = LocalSfx::None;
+    constexpr size_t count = sizeof(kDizzySfx) / sizeof(kDizzySfx[0]);
+    size_t index = esp_random() % count;
+    if (count > 1 && kDizzySfx[index] == lastDizzySfx) {
+        index = (index + 1 + (esp_random() % (count - 1))) % count;
+    }
+    lastDizzySfx = kDizzySfx[index];
+    return lastDizzySfx;
+}
+
+LocalSfx randomTiltSfx()
+{
+    static constexpr LocalSfx kTiltSfx[] = {
+        LocalSfx::TiltCuidao,
+        LocalSfx::TiltDerechito,
+        LocalSfx::TiltWifi,
+        LocalSfx::TiltDesconfiguro,
+    };
+    static LocalSfx lastTiltSfx = LocalSfx::None;
+    constexpr size_t count = sizeof(kTiltSfx) / sizeof(kTiltSfx[0]);
+    size_t index = esp_random() % count;
+    if (count > 1 && kTiltSfx[index] == lastTiltSfx) {
+        index = (index + 1 + (esp_random() % (count - 1))) % count;
+    }
+    lastTiltSfx = kTiltSfx[index];
+    return lastTiltSfx;
+}
+
+bool maybeTriggerChiquitoEasterEgg(String text)
+{
+    text = normalizedTriggerText(text);
+    static const char* const chiquitoWords[] = {
+        "chiquito", "calzada", "fistro", "pecador", "jarl", "no puedor",
+        "cobarde", "torpedo", "grijander", "condemor"
+    };
+    if (!containsAny(text, chiquitoWords, sizeof(chiquitoWords) / sizeof(chiquitoWords[0]))) {
+        return false;
+    }
+    uint32_t now = millis();
+    if (now < gNextChiquitoEasterEggAllowedAt) {
+        return false;
+    }
+    gNextChiquitoEasterEggAllowedAt = now + kChiquitoEasterEggCooldownMs;
+    gVisual.setExpressionFor(VisualExpression::Surprised, 1400);
+    setRobotState(VisualState::Speaking);
+    gGestures.performChiquitoEasterEgg();
+    LocalSfx sfx = randomChiquitoSfx();
+    logLine(String("Chiquito pre-answer easter egg: ") + localSfxPath(sfx));
+    playLocalSfx(sfx);
+    gPlaybackMouthLevel = 0;
+    gVisual.setState(VisualState::Thinking);
+    gGestures.forceCenter(220);
+    serviceRobot();
+    return true;
+}
+
 ResponseAffect classifyResponseAffect(String text)
 {
-    text.toLowerCase();
+    text = normalizedTriggerText(text);
 
     static const char* const refusalWords[] = {
         "no puedo", "no debo", "no te puedo", "no seria seguro", "no es seguro", "no voy a",
@@ -1330,7 +2215,7 @@ bool shouldSkipQueuedToolGesture(ContentGesture gesture, String outputTranscript
         return false;
     }
 
-    outputTranscript.toLowerCase();
+    outputTranscript = normalizedTriggerText(outputTranscript);
     static const char* const greetingWords[] = {
         "hola", "bienvenido", "encantado", "soy mika", "en que puedo ayudarte",
         "que quieres saber"
@@ -1364,12 +2249,12 @@ void applyQueuedToolGesture(const String& outputTranscript, bool playbackStarted
 
 bool looksLikeBlockedRequest(String text)
 {
-    text.toLowerCase();
+    text = normalizedTriggerText(text);
     static const char* const blockedIntentWords[] = {
         "quiero hack", "quiero jaque", "quiero paque", "hackear", "jaquear", "paquear",
         "ayudame a hack", "como hack", "como atacar", "quiero atacar", "robar contrase",
         "robar cuenta", "crear malware", "hacer malware", "crear virus", "hacer virus",
-        "ddos", "ransomware"
+        "hacer ddos", "ataque ddos", "crear ransomware", "hacer ransomware"
     };
     return containsAny(text, blockedIntentWords, sizeof(blockedIntentWords) / sizeof(blockedIntentWords[0]));
 }
@@ -1399,6 +2284,9 @@ void applyResponseAffect(const String& outputTranscript, bool playbackStarted, R
 
     applyQueuedToolGesture(outputTranscript, playbackStarted, runtime);
     ResponseAffect affect = classifyResponseAffect(outputTranscript);
+    if (affect.expression == VisualExpression::Sad && affect.gesture == ContentGesture::Shake) {
+        requestLocalSfxThrottled(LocalSfx::SadAww, gNextDangerSfxAllowedAt, kDangerSfxCooldownMs);
+    }
     if (!runtime.toolExpressionApplied && (!runtime.expressionApplied || runtime.lastExpression != affect.expression)) {
         gVisual.setExpression(affect.expression);
         runtime.expressionApplied = true;
@@ -1428,12 +2316,166 @@ void setStatusColor(uint8_t r, uint8_t g, uint8_t b)
     M5StackChan.showRgbColor(r, g, b);
 }
 
+void processImuReactions()
+{
+    bool allowed = gRuntimeConfig.imuReactionsEnabled &&
+                   gReadyForVoice &&
+                   !gTurnRunning &&
+                   !gResponsePlaybackActive &&
+                   !gPhotoWorkflowBusy &&
+                   !gLocalSfxPlaying &&
+                   gPendingLocalSfx == LocalSfx::None &&
+                   !rawTopTouchActive() &&
+                   !gGestures.isBusy();
+
+    ImuReactionEvent event = gImuReactions.update(allowed);
+    if (event.type == ImuReactionType::None) {
+        return;
+    }
+
+    if (event.type == ImuReactionType::Shake) {
+        gVisual.setExpressionFor(VisualExpression::Dizzy, 2800);
+        gGestures.performDizzyReaction();
+        requestLocalSfx(randomDizzySfx());
+        logLine(String("IMU reaction: shake amount=") + String(event.amount, 2));
+        return;
+    }
+
+    if (event.type == ImuReactionType::Tilt) {
+        gVisual.setExpressionFor(VisualExpression::Surprised, 1900);
+        gGestures.performTiltComplaint(event.side);
+        requestLocalSfx(randomTiltSfx());
+        logLine(String("IMU reaction: tilt angle=") + String(event.amount, 1));
+    }
+}
+
+String compactNfcText(const char* text)
+{
+    String out = text == nullptr ? "" : String(text);
+    out.replace("\r", " ");
+    out.replace("\n", " ");
+    out.trim();
+    if (out.length() > 160) {
+        out.remove(157);
+        out += "...";
+    }
+    return out;
+}
+
+bool beginNfcDiagnostics()
+{
+    if (!kNfcDiagnosticsEnabled) {
+        return false;
+    }
+    if (!gNfcUnits.add(gNfcUnit, M5.In_I2C) || !gNfcUnits.begin()) {
+        logLine("WARN NFC diagnostics unavailable");
+        return false;
+    }
+    logLine("OK NFC diagnostics NFC-A");
+    return true;
+}
+
+void logNdefRecords()
+{
+    bool valid = false;
+    if (!gNfcLayerA.ndefIsValidFormat(valid)) {
+        logLine("NFC NDEF: check failed");
+        return;
+    }
+    if (!valid) {
+        logLine("NFC NDEF: not formatted");
+        return;
+    }
+
+    m5::nfc::ndef::TLV msg;
+    if (!gNfcLayerA.ndefRead(msg)) {
+        logLine("NFC NDEF: read failed");
+        return;
+    }
+    if (!msg.isMessageTLV()) {
+        logLine("NFC NDEF: empty");
+        return;
+    }
+
+    uint32_t idx = 0;
+    for (const auto& record : msg.records()) {
+        String payload = compactNfcText(record.payloadAsString().c_str());
+        String line = String("NFC NDEF record ") + idx +
+                      " tnf=" + static_cast<uint8_t>(record.tnf()) +
+                      " type=" + record.type() +
+                      " size=" + record.payloadSize();
+        if (!payload.isEmpty()) {
+            line += " payload=\"";
+            line += payload;
+            line += "\"";
+        }
+        logLine(line);
+        ++idx;
+        if (idx >= 4) {
+            logLine("NFC NDEF: remaining records skipped");
+            break;
+        }
+    }
+}
+
+void processNfcDiagnostics()
+{
+    if (!gNfcReady) {
+        return;
+    }
+    uint32_t now = millis();
+    if (now < gNextNfcPollAt) {
+        return;
+    }
+    gNextNfcPollAt = now + kNfcPollIntervalMs;
+
+    if (!gReadyForVoice || gTurnRunning || gResponsePlaybackActive || gPhotoWorkflowBusy || gLocalSfxPlaying ||
+        gPendingLocalSfx != LocalSfx::None || rawTopTouchActive()) {
+        return;
+    }
+
+    gNfcUnits.update();
+
+    std::vector<m5::nfc::a::PICC> piccs;
+    if (!gNfcLayerA.detect(piccs, kNfcDetectTimeoutMs)) {
+        return;
+    }
+
+    uint32_t idx = 0;
+    for (auto& picc : piccs) {
+        if (!gNfcLayerA.identify(picc)) {
+            logLine(String("NFC-A identify failed uid=") + picc.uidAsString().c_str());
+            continue;
+        }
+
+        String uid = picc.uidAsString().c_str();
+        if (uid == gLastNfcUid && now - gLastNfcSeenAt < 1800) {
+            continue;
+        }
+        gLastNfcUid = uid;
+        gLastNfcSeenAt = now;
+
+        char line[240];
+        snprintf(line, sizeof(line), "NFC-A[%lu] uid=%s type=%s atqa=%04X sak=%02X user=%u total=%u",
+                 static_cast<unsigned long>(idx), uid.c_str(), picc.typeAsString().c_str(), picc.atqa, picc.sak,
+                 picc.userAreaSize(), picc.totalSize());
+        logLine(line);
+        logNdefRecords();
+
+        gVisual.setExpressionFor(VisualExpression::Happy, 900);
+        setStatusColor(0, 24, 28);
+        ++idx;
+    }
+    gNfcLayerA.deactivate();
+}
+
 void serviceRobot()
 {
     M5StackChan.update();
     gGestures.update();
     gVisual.update();
     handleScreenMouthTouch(millis());
+    processImuReactions();
 }
 
 bool requestBargeIn()
@@ -1441,7 +2483,6 @@ bool requestBargeIn()
     if (!gBargeInRequested) {
         gBargeInRequested = true;
         gAutoStartVoiceTurn = true;
-        gNextTurnTouchReleaseMode = true;
         setStatusColor(40, 24, 0);
         logLine("Barge-in requested");
     }
@@ -1596,6 +2637,297 @@ bool base64EncodeBytes(const uint8_t* data, size_t len, String& out)
     }
 
     out = String(reinterpret_cast<char*>(encoded.data()), outLen);
+    if (out.length() != outLen) {
+        logLine(String("Base64 string alloc fail bytes=") + outLen);
+        return false;
+    }
+    return true;
+}
+
+bool readBinaryFile(const char* path, std::vector<uint8_t>& out, size_t maxBytes)
+{
+    out.clear();
+    File file = LittleFS.open(path, "r");
+    if (!file) {
+        logLine(String("FAIL open file: ") + path);
+        return false;
+    }
+    size_t bytes = file.size();
+    if (bytes == 0 || bytes > maxBytes) {
+        logLine(String("FAIL file size: ") + path + " bytes=" + bytes);
+        file.close();
+        return false;
+    }
+    out.resize(bytes);
+    size_t read = file.read(out.data(), bytes);
+    file.close();
+    if (read != bytes) {
+        logLine(String("FAIL file read: ") + path);
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+bool writeBinaryFile(const char* path, const uint8_t* data, size_t len)
+{
+    File file = LittleFS.open(path, "w");
+    if (!file) {
+        logLine(String("FAIL create file: ") + path);
+        return false;
+    }
+    size_t written = file.write(data, len);
+    file.close();
+    if (written != len) {
+        logLine(String("FAIL file write: ") + path);
+        return false;
+    }
+    return true;
+}
+
+void appendJsonString(String& out, const String& value)
+{
+    out += '"';
+    for (size_t i = 0; i < value.length(); ++i) {
+        char c = value[i];
+        switch (c) {
+            case '"':
+                out += "\\\"";
+                break;
+            case '\\':
+                out += "\\\\";
+                break;
+            case '\n':
+                out += "\\n";
+                break;
+            case '\r':
+                out += "\\r";
+                break;
+            case '\t':
+                out += "\\t";
+                break;
+            default:
+                if (static_cast<uint8_t>(c) < 0x20) {
+                    out += ' ';
+                } else {
+                    out += c;
+                }
+                break;
+        }
+    }
+    out += '"';
+}
+
+bool extractFirstJsonTextField(const String& json, String& out)
+{
+    out = "";
+    int key = json.indexOf("\"text\"");
+    while (key >= 0) {
+        int colon = json.indexOf(':', key + 6);
+        if (colon < 0) {
+            return false;
+        }
+        int quote = colon + 1;
+        while (quote < static_cast<int>(json.length()) &&
+               isspace(static_cast<unsigned char>(json[quote]))) {
+            ++quote;
+        }
+        if (quote >= static_cast<int>(json.length()) || json[quote] != '"') {
+            key = json.indexOf("\"text\"", key + 6);
+            continue;
+        }
+
+        bool escape = false;
+        for (int i = quote + 1; i < static_cast<int>(json.length()); ++i) {
+            char c = json[i];
+            if (escape) {
+                switch (c) {
+                    case '"':
+                    case '\\':
+                    case '/':
+                        out += c;
+                        break;
+                    case 'n':
+                        out += '\n';
+                        break;
+                    case 'r':
+                        out += '\r';
+                        break;
+                    case 't':
+                        out += '\t';
+                        break;
+                    default:
+                        out += c;
+                        break;
+                }
+                escape = false;
+            } else if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                out.trim();
+                return !out.isEmpty();
+            } else {
+                out += c;
+            }
+        }
+        return false;
+    }
+    return false;
+}
+
+int parseHttpStatusCode(const String& statusLine)
+{
+    int firstSpace = statusLine.indexOf(' ');
+    if (firstSpace < 0 || firstSpace + 4 > static_cast<int>(statusLine.length())) {
+        return 0;
+    }
+    return statusLine.substring(firstSpace + 1, firstSpace + 4).toInt();
+}
+
+bool readHttpBodyRaw(WiFiClientSecure& client, String& out, size_t maxBytes, uint32_t timeoutMs)
+{
+    out = "";
+    uint32_t deadline = millis() + timeoutMs;
+    while (millis() < deadline) {
+        int available = client.available();
+        if (available <= 0) {
+            if (!client.connected()) {
+                return true;
+            }
+            serviceRobot();
+            delay(5);
+            continue;
+        }
+        while (available-- > 0) {
+            int c = client.read();
+            if (c < 0) {
+                break;
+            }
+            if (out.length() >= maxBytes) {
+                return false;
+            }
+            out += static_cast<char>(c);
+        }
+    }
+    return false;
+}
+
+bool decodeChunkedBody(const String& raw, String& decoded)
+{
+    decoded = "";
+    int pos = 0;
+    while (pos < static_cast<int>(raw.length())) {
+        int lineEnd = raw.indexOf("\r\n", pos);
+        if (lineEnd < 0) {
+            return false;
+        }
+        String lenText = raw.substring(pos, lineEnd);
+        int semicolon = lenText.indexOf(';');
+        if (semicolon >= 0) {
+            lenText = lenText.substring(0, semicolon);
+        }
+        lenText.trim();
+        uint32_t chunkLen = strtoul(lenText.c_str(), nullptr, 16);
+        pos = lineEnd + 2;
+        if (chunkLen == 0) {
+            return true;
+        }
+        if (pos + static_cast<int>(chunkLen) > static_cast<int>(raw.length())) {
+            return false;
+        }
+        decoded += raw.substring(pos, pos + chunkLen);
+        pos += chunkLen;
+        if (pos + 2 <= static_cast<int>(raw.length()) && raw.substring(pos, pos + 2) == "\r\n") {
+            pos += 2;
+        }
+    }
+    return false;
+}
+
+bool postGeminiGenerateContentManual(const String& model, const String& body, String& response)
+{
+    response = "";
+    const char* host = "generativelanguage.googleapis.com";
+    String path = "/v1beta/models/" + generateModelName(model) + ":generateContent";
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(12000);
+    logLine("Vision TLS connect...");
+    if (!client.connect(host, 443)) {
+        gLastVisionTransportError = true;
+        gLastVisionError = "Vision transport: TLS connect fallo.";
+        logLine("FAIL vision TLS connect");
+        return false;
+    }
+
+    client.print(String("POST ") + path + " HTTP/1.1\r\n");
+    client.print(String("Host: ") + host + "\r\n");
+    client.print("Content-Type: application/json\r\n");
+    client.print(String("x-goog-api-key: ") + gSecrets.geminiApiKey + "\r\n");
+    client.print(String("Content-Length: ") + body.length() + "\r\n");
+    client.print("Connection: close\r\n");
+    client.print("User-Agent: StackChan-GSEC-Diag/0.1\r\n");
+    client.print("\r\n");
+
+    size_t written = client.write(reinterpret_cast<const uint8_t*>(body.c_str()), body.length());
+    if (written != body.length()) {
+        gLastVisionTransportError = true;
+        gLastVisionError = "Vision transport: payload incompleto.";
+        logLine(String("FAIL vision write: ") + written + "/" + body.length());
+        client.stop();
+        return false;
+    }
+
+    String statusLine = readHttpLine(client, 12000);
+    int status = parseHttpStatusCode(statusLine);
+    logLine(String("Vision HTTP manual: ") + status);
+    if (status == 0) {
+        gLastVisionTransportError = true;
+        gLastVisionError = "Vision transport: sin status HTTP.";
+        client.stop();
+        return false;
+    }
+
+    bool chunked = false;
+    while (true) {
+        String line = readHttpLine(client, 5000);
+        if (line == "\r\n" || line.length() == 0) {
+            break;
+        }
+        String lower = line;
+        lower.toLowerCase();
+        if (lower.indexOf("transfer-encoding:") >= 0 && lower.indexOf("chunked") >= 0) {
+            chunked = true;
+        }
+    }
+
+    String rawBody;
+    bool readOk = readHttpBodyRaw(client, rawBody, 48 * 1024, 20000);
+    client.stop();
+    if (!readOk) {
+        gLastVisionTransportError = true;
+        gLastVisionError = "Vision transport: timeout leyendo respuesta.";
+        logLine(String("FAIL vision body read bytes: ") + rawBody.length());
+        return false;
+    }
+    if (chunked) {
+        String decoded;
+        if (!decodeChunkedBody(rawBody, decoded)) {
+            gLastVisionError = "Vision: no he podido decodificar chunks.";
+            logLine(String("FAIL vision chunk decode bytes: ") + rawBody.length());
+            return false;
+        }
+        response = decoded;
+    } else {
+        response = rawBody;
+    }
+
+    if (status != 200) {
+        gLastVisionError = String("Vision HTTP ") + status + ": " + response.substring(0, 90);
+        logLine(String("FAIL vision manual body: ") + response.substring(0, 160));
+        return false;
+    }
     return true;
 }
 
@@ -2385,6 +3717,58 @@ const char* localSfxPath(LocalSfx sfx)
             return "/sfx/giggle_24k.pcm";
         case LocalSfx::Dance:
             return "/sfx/dance_loop_24k.pcm";
+        case LocalSfx::GiggleSoft:
+            return "/sfx/neutral_giggle_soft_24k.pcm";
+        case LocalSfx::GiggleBright:
+            return "/sfx/neutral_giggle_bright_24k.pcm";
+        case LocalSfx::AckAha:
+            return "/sfx/neutral_ack_aha_24k.pcm";
+        case LocalSfx::AckMhm:
+            return "/sfx/neutral_ack_mhm_24k.pcm";
+        case LocalSfx::SurpriseOoh:
+            return "/sfx/neutral_surprise_ooh_24k.pcm";
+        case LocalSfx::SurpriseGasp:
+            return "/sfx/neutral_surprise_gasp_24k.pcm";
+        case LocalSfx::SadAww:
+            return "/sfx/neutral_sad_aww_24k.pcm";
+        case LocalSfx::ReliefPhew:
+            return "/sfx/neutral_relief_phew_24k.pcm";
+        case LocalSfx::ConfusedHuh:
+            return "/sfx/neutral_confused_huh_24k.pcm";
+        case LocalSfx::Tada:
+            return "/sfx/neutral_tada_24k.pcm";
+        case LocalSfx::ThinkingMmm:
+            return "/sfx/neutral_thinking_mmm_24k.pcm";
+        case LocalSfx::ThinkingHmm:
+            return "/sfx/neutral_thinking_hmm_24k.pcm";
+        case LocalSfx::ThinkingMmmSoft:
+            return "/sfx/think_mmm_soft_24k.pcm";
+        case LocalSfx::ThinkingMmmRise:
+            return "/sfx/think_mmm_rise_24k.pcm";
+        case LocalSfx::ThinkingMmmShort:
+            return "/sfx/think_mmm_short_24k.pcm";
+        case LocalSfx::ThinkingHmmSoft:
+            return "/sfx/think_hmm_soft_24k.pcm";
+        case LocalSfx::ChiquitoGrito:
+            return "/sfx/chiquito_grito_24k.pcm";
+        case LocalSfx::ChiquitoEpetekan:
+            return "/sfx/chiquito_epetekan_24k.pcm";
+        case LocalSfx::DizzyMareao:
+            return "/sfx/dizzy_mareao_24k.pcm";
+        case LocalSfx::DizzyMeneito:
+            return "/sfx/dizzy_meneito_24k.pcm";
+        case LocalSfx::DizzyBits:
+            return "/sfx/dizzy_bits_24k.pcm";
+        case LocalSfx::DizzyFirewalls:
+            return "/sfx/dizzy_firewalls_24k.pcm";
+        case LocalSfx::TiltCuidao:
+            return "/sfx/tilt_cuidao_24k.pcm";
+        case LocalSfx::TiltDerechito:
+            return "/sfx/tilt_derechito_24k.pcm";
+        case LocalSfx::TiltWifi:
+            return "/sfx/tilt_wifi_24k.pcm";
+        case LocalSfx::TiltDesconfiguro:
+            return "/sfx/tilt_desconfiguro_24k.pcm";
         case LocalSfx::None:
         default:
             return "";
@@ -2396,6 +3780,43 @@ void requestLocalSfx(LocalSfx sfx)
     if (sfx != LocalSfx::None && gPendingLocalSfx == LocalSfx::None) {
         gPendingLocalSfx = sfx;
     }
+}
+
+bool requestLocalSfxThrottled(LocalSfx sfx, uint32_t& nextAllowedAt, uint32_t cooldownMs)
+{
+    uint32_t now = millis();
+    if (now < nextAllowedAt || gPendingLocalSfx != LocalSfx::None || gLocalSfxPlaying) {
+        return false;
+    }
+    requestLocalSfx(sfx);
+    nextAllowedAt = now + cooldownMs;
+    return true;
+}
+
+LocalSfx randomThinkingSfx()
+{
+    static constexpr LocalSfx kThinkingSfx[] = {
+        LocalSfx::ThinkingMmmRise,
+        LocalSfx::ThinkingHmmSoft,
+        LocalSfx::ThinkingHmm,
+    };
+    size_t index = esp_random() % (sizeof(kThinkingSfx) / sizeof(kThinkingSfx[0]));
+    return kThinkingSfx[index];
+}
+
+bool shouldUseThinkingSfxThisTurn(const RuntimeConfig& config, bool i2sPlayback)
+{
+    if (!i2sPlayback || !config.thinkingSfxEnabled || config.thinkingSfxChancePercent <= 0) {
+        return false;
+    }
+
+    uint32_t now = millis();
+    uint32_t minIntervalMs = static_cast<uint32_t>(config.thinkingSfxMinIntervalSeconds) * 1000UL;
+    if (minIntervalMs > 0 && gLastThinkingSfxAt > 0 && now - gLastThinkingSfxAt < minIntervalMs) {
+        return false;
+    }
+
+    return static_cast<int>(esp_random() % 100) < config.thinkingSfxChancePercent;
 }
 
 bool readPcm16File(const char* path, std::vector<int16_t>& pcm)
@@ -2439,14 +3860,16 @@ void playLocalSfx(LocalSfx sfx)
 
     logLine(String("SFX play: ") + path);
     I2sRingAudioPlayer player;
+    gLocalSfxPlaying = true;
     if (player.appendPcm(pcm)) {
         player.finish();
     }
+    gLocalSfxPlaying = false;
 }
 
 void processPendingLocalSfx()
 {
-    if (gTurnRunning || gPendingLocalSfx == LocalSfx::None) {
+    if (gTurnRunning || gLocalSfxPlaying || gPendingLocalSfx == LocalSfx::None) {
         return;
     }
 
@@ -2537,24 +3960,46 @@ bool connectWifi(const std::vector<WifiNetwork>& networks)
     WiFi.disconnect(false, false);
     delay(300);
 
-    logLine("WiFi scan...");
-    int found = WiFi.scanNetworks(false, true);
-    logLine(String("WiFi visible: ") + found);
     std::vector<String> visibleSsids;
-    if (found > 0) {
-        visibleSsids.reserve(found);
+    int found = -1;
+    auto scanVisibleNetworks = [&]() {
+        visibleSsids.clear();
+        logLine("WiFi scan...");
+        found = WiFi.scanNetworks(false, true);
+        logLine(String("WiFi visible: ") + found);
+        if (found > 0) {
+            visibleSsids.reserve(found);
+        }
+        for (int i = 0; i < found && i < 20; ++i) {
+            String ssid = WiFi.SSID(i);
+            visibleSsids.push_back(ssid);
+            logLine(String("  ") + ssid + " RSSI=" + WiFi.RSSI(i));
+        }
+        for (int i = 20; i < found; ++i) {
+            visibleSsids.push_back(WiFi.SSID(i));
+        }
+        WiFi.scanDelete();
+        WiFi.disconnect(false, false);
+        delay(300);
+    };
+    auto hasConfiguredVisible = [&]() {
+        if (found < 0) {
+            return true;
+        }
+        for (const auto& network : networks) {
+            if (std::find(visibleSsids.begin(), visibleSsids.end(), network.ssid) != visibleSsids.end()) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    scanVisibleNetworks();
+    for (int retry = 0; found >= 0 && !hasConfiguredVisible() && retry < 2; ++retry) {
+        logLine("WiFi no configured SSID visible; rescanning...");
+        delay(900);
+        scanVisibleNetworks();
     }
-    for (int i = 0; i < found && i < 20; ++i) {
-        String ssid = WiFi.SSID(i);
-        visibleSsids.push_back(ssid);
-        logLine(String("  ") + ssid + " RSSI=" + WiFi.RSSI(i));
-    }
-    for (int i = 20; i < found; ++i) {
-        visibleSsids.push_back(WiFi.SSID(i));
-    }
-    WiFi.scanDelete();
-    WiFi.disconnect(false, false);
-    delay(300);
 
     int maxPasses = found >= 0 ? 2 : 1;
     for (int pass = 0; pass < maxPasses; ++pass) {
@@ -2786,6 +4231,26 @@ RuntimeConfig buildRuntimeConfig(const std::vector<ConfigRow>& rows)
                 config.useGoogleSearch = normalizeBool(row.value) == "true" || normalizeBool(row.value) == "yes";
             } else if (key == "enable_robot_tools") {
                 config.enableRobotTools = normalizeBool(row.value) == "true" || normalizeBool(row.value) == "yes";
+            } else if (key == "gemini_robot_tools_enabled") {
+                config.geminiRobotToolsEnabled = normalizeBool(row.value) == "true" || normalizeBool(row.value) == "yes";
+            } else if (key == "imu_reactions_enabled") {
+                config.imuReactionsEnabled = normalizeBool(row.value) == "true" || normalizeBool(row.value) == "yes";
+            } else if (key == "thinking_sfx_enabled") {
+                config.thinkingSfxEnabled = normalizeBool(row.value) == "true" || normalizeBool(row.value) == "yes";
+            } else if (key == "thinking_sfx_chance_percent") {
+                config.thinkingSfxChancePercent = row.value.toInt();
+            } else if (key == "thinking_sfx_delay_ms") {
+                config.thinkingSfxDelayMs = row.value.toInt();
+            } else if (key == "thinking_sfx_min_interval_seconds") {
+                config.thinkingSfxMinIntervalSeconds = row.value.toInt();
+            } else if (key == "image_edit_enabled") {
+                config.imageEditEnabled = false;
+            } else if (key == "vision_description_model") {
+                config.visionDescriptionModel = row.value;
+                config.visionDescriptionModel.trim();
+            } else if (key == "image_edit_model") {
+                config.imageEditModel = row.value;
+                config.imageEditModel.trim();
             } else if (key == "conversation_memory_enabled") {
                 config.conversationMemoryEnabled = normalizeBool(row.value) == "true" || normalizeBool(row.value) == "yes";
             } else if (key == "max_answer_seconds") {
@@ -2796,6 +4261,14 @@ RuntimeConfig buildRuntimeConfig(const std::vector<ConfigRow>& rows)
                 config.conversationTimeoutSeconds = row.value.toInt();
             } else if (key == "conversation_max_turns") {
                 config.conversationMaxTurns = row.value.toInt();
+            } else if (key == "hot_session_enabled") {
+                config.hotSessionEnabled = normalizeBool(row.value) == "true" || normalizeBool(row.value) == "yes";
+            } else if (key == "hot_session_idle_timeout_seconds") {
+                config.hotSessionIdleTimeoutSeconds = row.value.toInt();
+            } else if (key == "hot_session_max_age_seconds") {
+                config.hotSessionMaxAgeSeconds = row.value.toInt();
+            } else if (key == "hot_session_max_turns") {
+                config.hotSessionMaxTurns = row.value.toInt();
             }
             continue;
         }
@@ -2823,7 +4296,7 @@ RuntimeConfig buildRuntimeConfig(const std::vector<ConfigRow>& rows)
         }
     }
 
-    if (config.enableRobotTools) {
+    if (config.geminiRobotToolsEnabled) {
         prompt += "\nCONTROL DE CARA Y GESTOS:\n";
         prompt += "- Puedes usar herramientas para cambiar mi cara o mover la cabeza.\n";
         prompt += "- Usa set_expression al inicio de una respuesta si la emocion es clara.\n";
@@ -2834,6 +4307,18 @@ RuntimeConfig buildRuntimeConfig(const std::vector<ConfigRow>& rows)
 
     config.conversationTimeoutSeconds = std::max(30, std::min(config.conversationTimeoutSeconds, 1800));
     config.conversationMaxTurns = std::max(1, std::min(config.conversationMaxTurns, 10));
+    config.hotSessionIdleTimeoutSeconds = std::max(15, std::min(config.hotSessionIdleTimeoutSeconds, 300));
+    config.hotSessionMaxAgeSeconds = std::max(60, std::min(config.hotSessionMaxAgeSeconds, 900));
+    config.hotSessionMaxTurns = std::max(1, std::min(config.hotSessionMaxTurns, 10));
+    config.thinkingSfxChancePercent = std::max(0, std::min(config.thinkingSfxChancePercent, kThinkingSfxDefaultChancePercent));
+    config.thinkingSfxDelayMs = std::max(static_cast<int>(kThinkingSfxDefaultDelayMs), std::min(config.thinkingSfxDelayMs, 2500));
+    config.thinkingSfxMinIntervalSeconds = std::max(static_cast<int>(kThinkingSfxDefaultMinIntervalMs / 1000), std::min(config.thinkingSfxMinIntervalSeconds, 120));
+    if (config.visionDescriptionModel.isEmpty()) {
+        config.visionDescriptionModel = "gemini-3-flash-preview";
+    }
+    if (config.imageEditModel.isEmpty()) {
+        config.imageEditModel = "gemini-2.5-flash-image";
+    }
     config.systemPrompt = prompt;
     return config;
 }
@@ -2845,10 +4330,21 @@ void logRuntimeConfigSummary(const RuntimeConfig& config)
         logLine(String("Voice: ") + config.voiceName);
     }
     logLine(String("Playback: ") + config.playbackMode);
-    logLine(String("Robot tools: ") + (config.enableRobotTools ? "on" : "off"));
+    logLine(String("Local robot gestures: ") + (config.enableRobotTools ? "on" : "off"));
+    logLine(String("Gemini robot tools: ") + (config.geminiRobotToolsEnabled ? "on" : "off"));
+    logLine(String("IMU reactions: ") + (config.imuReactionsEnabled ? "on" : "off"));
+    logLine(String("Thinking SFX: ") + (config.thinkingSfxEnabled ? "on" : "off") +
+            " chance=" + config.thinkingSfxChancePercent +
+            " delay_ms=" + config.thinkingSfxDelayMs +
+            " min_s=" + config.thinkingSfxMinIntervalSeconds);
+    logLine("Image edit: disabled in firmware");
     logLine(String("Conversation memory: ") + (config.conversationMemoryEnabled ? "on" : "off") +
             " turns=" + config.conversationMaxTurns +
             " timeout_s=" + config.conversationTimeoutSeconds);
+    logLine(String("Hot Live session: ") + (config.hotSessionEnabled ? "on" : "off") +
+            " idle_s=" + config.hotSessionIdleTimeoutSeconds +
+            " max_age_s=" + config.hotSessionMaxAgeSeconds +
+            " turns=" + config.hotSessionMaxTurns);
     logLine(String("Prompt bytes: ") + config.systemPrompt.length());
 }
 
@@ -2917,6 +4413,7 @@ bool reloadRuntimeConfigFromRemote()
     gReadyForVoice = false;
     setRobotState(VisualState::Thinking);
     logLine("Config reload start");
+    closeHotLiveSession("config reload");
 
     if (WiFi.status() != WL_CONNECTED) {
         logLine("WiFi reconnect for config reload...");
@@ -2943,6 +4440,694 @@ bool reloadRuntimeConfigFromRemote()
     gTouchLevelActiveSince = 0;
     logLine("Touch top for voice turn");
     return ok;
+}
+
+String generateModelName(String model)
+{
+    model.trim();
+    if (model.startsWith("models/")) {
+        model.remove(0, 7);
+    }
+    return model;
+}
+
+String generateContentUrl(const String& model)
+{
+    return "https://generativelanguage.googleapis.com/v1beta/models/" + generateModelName(model) + ":generateContent";
+}
+
+void drawPhotoStatus(const String& title, const String& detail = "")
+{
+    gVisual.suspendDrawingFor(120000);
+    auto& display = M5StackChan.Display();
+    display.fillScreen(TFT_BLACK);
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+    display.setTextSize(2);
+    display.setCursor(14, 34);
+    display.println(title);
+    if (!detail.isEmpty()) {
+        display.setTextSize(1);
+        display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        display.setCursor(14, 88);
+        display.println(detail);
+    }
+}
+
+void drawPhotoCountdown()
+{
+    gVisual.suspendDrawingFor(8000);
+    auto& display = M5StackChan.Display();
+    for (int i = 3; i >= 1; --i) {
+        display.fillScreen(TFT_BLACK);
+        display.setTextColor(TFT_WHITE, TFT_BLACK);
+        display.setTextSize(2);
+        display.setCursor(36, 42);
+        display.println("Prepara el objeto");
+        display.setTextSize(7);
+        display.setCursor(138, 104);
+        display.println(i);
+        setStatusColor(24, 24, 40);
+        uint32_t until = millis() + 850;
+        while (millis() < until) {
+            serviceRobot();
+            delay(20);
+        }
+    }
+}
+
+bool beginStackChanCamera()
+{
+    if (gCameraInitialized) {
+        return true;
+    }
+
+    camera_config_t config = {};
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.ledc_timer = LEDC_TIMER_0;
+    config.pin_d0 = 39;
+    config.pin_d1 = 40;
+    config.pin_d2 = 41;
+    config.pin_d3 = 42;
+    config.pin_d4 = 15;
+    config.pin_d5 = 16;
+    config.pin_d6 = 48;
+    config.pin_d7 = 47;
+    config.pin_xclk = 2;
+    config.pin_pclk = 45;
+    config.pin_vsync = 46;
+    config.pin_href = 38;
+    config.pin_sccb_sda = -1;
+    config.pin_sccb_scl = -1;
+    config.sccb_i2c_port = M5.In_I2C.getPort();
+    config.pin_pwdn = -1;
+    config.pin_reset = -1;
+    config.xclk_freq_hz = 20000000;
+    config.frame_size = FRAMESIZE_QVGA;
+    config.pixel_format = PIXFORMAT_RGB565;
+    config.grab_mode = CAMERA_GRAB_LATEST;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+    config.jpeg_quality = 10;
+    config.fb_count = 1;
+
+    esp_err_t err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+        logLine(String("Camera SCCB reused I2C port ") + static_cast<int>(config.sccb_i2c_port));
+        logLine(String("FAIL camera init: 0x") + String(static_cast<uint32_t>(err), HEX));
+        return false;
+    }
+
+    sensor_t* sensor = esp_camera_sensor_get();
+    if (sensor != nullptr) {
+        sensor->set_framesize(sensor, FRAMESIZE_QVGA);
+        sensor->set_pixformat(sensor, PIXFORMAT_RGB565);
+        sensor->set_vflip(sensor, 0);
+        sensor->set_hmirror(sensor, 0);
+        sensor->set_brightness(sensor, 0);
+        sensor->set_saturation(sensor, 0);
+    }
+
+    gCameraInitialized = true;
+    logLine("OK camera init");
+    return true;
+}
+
+void endStackChanCamera()
+{
+    if (!gCameraInitialized) {
+        return;
+    }
+    esp_camera_deinit();
+    gCameraInitialized = false;
+    logLine("OK camera deinit");
+}
+
+bool capturePhotoToJpeg()
+{
+    drawPhotoCountdown();
+    setRobotState(VisualState::Thinking);
+    drawPhotoStatus("Capturando...");
+
+    if (!beginStackChanCamera()) {
+        drawPhotoStatus("Camara no disponible", "No he podido inicializar la GC0308.");
+        return false;
+    }
+
+    camera_fb_t* fb = nullptr;
+    for (int i = 0; i < 3; ++i) {
+        fb = esp_camera_fb_get();
+        if (fb != nullptr) {
+            break;
+        }
+        delay(80);
+    }
+    if (fb == nullptr) {
+        logLine("FAIL camera frame");
+        endStackChanCamera();
+        drawPhotoStatus("No veo imagen", "La camara no devolvio frame.");
+        return false;
+    }
+
+    if (fb->format == PIXFORMAT_RGB565 && fb->width == 320 && fb->height == 240) {
+        gVisual.suspendDrawingFor(15000);
+        M5StackChan.Display().pushImage(0, 0, 320, 240, reinterpret_cast<uint16_t*>(fb->buf));
+    }
+
+    uint8_t* jpg = nullptr;
+    size_t jpgLen = 0;
+    bool converted = frame2jpg(fb, 62, &jpg, &jpgLen);
+    esp_camera_fb_return(fb);
+    if (!converted || jpg == nullptr || jpgLen == 0 || jpgLen > kMaxCapturedJpegBytes) {
+        if (jpg != nullptr) {
+            free(jpg);
+        }
+        logLine(String("FAIL camera jpg bytes=") + jpgLen);
+        endStackChanCamera();
+        drawPhotoStatus("Foto no valida", "No he podido convertir el frame a JPEG.");
+        return false;
+    }
+
+    bool saved = writeBinaryFile(kPhotoCapturePath, jpg, jpgLen);
+    free(jpg);
+    if (!saved) {
+        endStackChanCamera();
+        drawPhotoStatus("No puedo guardar", "LittleFS no guardo la foto.");
+        return false;
+    }
+
+    logLine(String("OK photo captured bytes: ") + jpgLen);
+    endStackChanCamera();
+    return true;
+}
+
+bool geminiGenerateTextFromImage(const char* imagePath, String prompt, String model, String& outText)
+{
+    outText = "";
+    gLastVisionError = "";
+    gLastVisionTransportError = false;
+    std::vector<uint8_t> image;
+    if (!readBinaryFile(imagePath, image, kMaxCapturedJpegBytes)) {
+        gLastVisionError = "No he podido leer el JPEG capturado.";
+        return false;
+    }
+
+    String imageBase64;
+    if (!base64EncodeBytes(image.data(), image.size(), imageBase64)) {
+        gLastVisionError = "No he podido codificar la imagen.";
+        return false;
+    }
+    size_t imageBytes = image.size();
+    image.clear();
+
+    String body;
+    size_t bodyCapacity = imageBase64.length() + prompt.length() + 256;
+    if (!body.reserve(bodyCapacity)) {
+        gLastVisionError = "Sin memoria para preparar Vision.";
+        logLine(String("FAIL vision body reserve: ") + bodyCapacity);
+        return false;
+    }
+    String normalizedModel = generateModelName(model);
+    normalizedModel.toLowerCase();
+    body += "{\"generationConfig\":{\"maxOutputTokens\":512,\"temperature\":0.2";
+    if (normalizedModel.indexOf("gemini-3") >= 0) {
+        body += ",\"thinkingConfig\":{\"thinkingLevel\":\"minimal\"}";
+    } else if (normalizedModel.indexOf("gemini-2.5-flash") >= 0) {
+        body += ",\"thinkingConfig\":{\"thinkingBudget\":0}";
+    }
+    body += "},\"contents\":[{\"parts\":[{\"inline_data\":{\"mime_type\":\"image/jpeg\",\"data\":\"";
+    body += imageBase64;
+    body += "\"}},{\"text\":";
+    appendJsonString(body, prompt);
+    body += "}]}]}";
+    imageBase64 = "";
+    logLine(String("Vision request image/body/model: ") + imageBytes + "/" + body.length() + "/" + model);
+
+    String response;
+    bool posted = postGeminiGenerateContentManual(model, body, response);
+    body = "";
+    if (!posted) {
+        return false;
+    }
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, response);
+    if (err) {
+        gLastVisionError = String("No he podido parsear Vision: ") + err.c_str();
+        logLine(String("FAIL vision parse: ") + err.c_str());
+        return false;
+    }
+
+    JsonArrayConst parts = doc["candidates"][0]["content"]["parts"].as<JsonArrayConst>();
+    for (JsonObjectConst part : parts) {
+        const char* text = part["text"] | nullptr;
+        if (text != nullptr) {
+            outText += text;
+        }
+    }
+    if (outText.isEmpty() && extractFirstJsonTextField(response, outText)) {
+        logLine(String("Vision raw text fallback bytes: ") + outText.length());
+    }
+    outText.trim();
+    if (outText.length() > 420) {
+        outText.remove(420);
+        outText += "...";
+    }
+    logLine(String("Vision text bytes: ") + outText.length());
+    if (outText.isEmpty()) {
+        String finishReason = doc["candidates"][0]["finishReason"] | "";
+        String blockReason = doc["promptFeedback"]["blockReason"] | "";
+        gLastVisionError = "Vision no ha devuelto texto.";
+        if (!finishReason.isEmpty()) {
+            gLastVisionError += " finish=";
+            gLastVisionError += finishReason;
+        }
+        if (!blockReason.isEmpty()) {
+            gLastVisionError += " block=";
+            gLastVisionError += blockReason;
+        }
+        logLine(String("FAIL vision no text finish/block: ") + finishReason + "/" + blockReason);
+        logLine(String("Vision response head: ") + response.substring(0, 260));
+        return false;
+    }
+    return true;
+}
+
+class StreamingBase64FileDecoder {
+public:
+    bool begin(const char* path)
+    {
+        file = LittleFS.open(path, "w");
+        charsInQuartet = 0;
+        decodedBytes = 0;
+        return static_cast<bool>(file);
+    }
+
+    bool push(char c)
+    {
+        if (!file) {
+            return false;
+        }
+        if (!(isalnum(static_cast<unsigned char>(c)) || c == '+' || c == '/' || c == '=')) {
+            return true;
+        }
+        quartet[charsInQuartet++] = static_cast<unsigned char>(c);
+        if (charsInQuartet < 4) {
+            return true;
+        }
+        unsigned char out[3] = {};
+        size_t outLen = 0;
+        int rc = mbedtls_base64_decode(out, sizeof(out), &outLen, quartet, 4);
+        charsInQuartet = 0;
+        if (rc != 0) {
+            logLine(String("FAIL image base64 decode: ") + rc);
+            return false;
+        }
+        if (outLen > 0 && file.write(out, outLen) != outLen) {
+            logLine("FAIL image file write");
+            return false;
+        }
+        decodedBytes += outLen;
+        return decodedBytes <= kMaxGenerateResponseBytes;
+    }
+
+    bool finish()
+    {
+        if (file) {
+            file.close();
+        }
+        return decodedBytes > 16 && decodedBytes <= kMaxGenerateResponseBytes;
+    }
+
+    size_t bytes() const
+    {
+        return decodedBytes;
+    }
+
+private:
+    File file;
+    unsigned char quartet[4] = {};
+    uint8_t charsInQuartet = 0;
+    size_t decodedBytes = 0;
+};
+
+bool extractInlineImageDataToFile(HTTPClient& http, const char* outputPath)
+{
+    WiFiClient* stream = http.getStreamPtr();
+    StreamingBase64FileDecoder decoder;
+    if (!decoder.begin(outputPath)) {
+        logLine("FAIL result file create");
+        return false;
+    }
+
+    enum class ParseState {
+        SeekingInlineData,
+        SeekingDataKey,
+        SeekingDataQuote,
+        InData,
+        EscapeInData,
+        Done,
+    };
+
+    ParseState state = ParseState::SeekingInlineData;
+    String window;
+    window.reserve(96);
+    uint32_t deadline = millis() + 120000;
+    bool found = false;
+    bool ok = true;
+
+    while (millis() < deadline && state != ParseState::Done && ok) {
+        int available = stream->available();
+        if (available <= 0) {
+            if (!http.connected()) {
+                break;
+            }
+            serviceRobot();
+            delay(10);
+            continue;
+        }
+
+        while (available-- > 0 && state != ParseState::Done && ok) {
+            char c = static_cast<char>(stream->read());
+            if (state == ParseState::InData) {
+                if (c == '\\') {
+                    state = ParseState::EscapeInData;
+                } else if (c == '"') {
+                    state = ParseState::Done;
+                    found = true;
+                } else {
+                    ok = decoder.push(c);
+                }
+                continue;
+            }
+            if (state == ParseState::EscapeInData) {
+                if (c == '/') {
+                    ok = decoder.push('/');
+                    state = ParseState::InData;
+                } else {
+                    state = ParseState::InData;
+                }
+                continue;
+            }
+
+            window += c;
+            if (window.length() > 90) {
+                window.remove(0, window.length() - 90);
+            }
+
+            if (state == ParseState::SeekingInlineData) {
+                if (window.indexOf("\"inlineData\"") >= 0 || window.indexOf("\"inline_data\"") >= 0) {
+                    state = ParseState::SeekingDataKey;
+                    window = "";
+                }
+            } else if (state == ParseState::SeekingDataKey) {
+                if (window.indexOf("\"data\"") >= 0) {
+                    state = ParseState::SeekingDataQuote;
+                    window = "";
+                }
+            } else if (state == ParseState::SeekingDataQuote) {
+                if (c == '"') {
+                    state = ParseState::InData;
+                }
+            }
+        }
+    }
+
+    ok = decoder.finish() && ok && found;
+    logLine(String("Image result bytes: ") + decoder.bytes());
+    if (!ok) {
+        LittleFS.remove(outputPath);
+    }
+    return ok;
+}
+
+bool displayGeneratedImage(const char* path)
+{
+    File file = LittleFS.open(path, "r");
+    if (!file) {
+        return false;
+    }
+    uint8_t sig[8] = {};
+    size_t read = file.read(sig, sizeof(sig));
+    file.close();
+    if (read < 4) {
+        return false;
+    }
+
+    gVisual.suspendDrawingFor(90000);
+    auto& display = M5StackChan.Display();
+    display.fillScreen(TFT_BLACK);
+    bool ok = false;
+    if (sig[0] == 0xFF && sig[1] == 0xD8) {
+        ok = display.drawJpgFile(LittleFS, path, 0, 0, display.width(), display.height());
+    } else if (sig[0] == 0x89 && sig[1] == 'P' && sig[2] == 'N' && sig[3] == 'G') {
+        ok = display.drawPngFile(LittleFS, path, 0, 0, display.width(), display.height());
+    }
+    if (!ok) {
+        drawPhotoStatus("Imagen recibida", "No he podido decodificarla en pantalla.");
+    }
+    return ok;
+}
+
+bool geminiEditImageToFile(const char* imagePath, String style, String model, const char* outputPath)
+{
+    std::vector<uint8_t> image;
+    if (!readBinaryFile(imagePath, image, kMaxCapturedJpegBytes)) {
+        return false;
+    }
+
+    String imageBase64;
+    if (!base64EncodeBytes(image.data(), image.size(), imageBase64)) {
+        return false;
+    }
+    image.clear();
+
+    style.trim();
+    if (style.isEmpty()) {
+        style = kPhotoEditDefaultStyle;
+    }
+
+    String prompt;
+    prompt.reserve(900);
+    prompt += "Edita la imagen proporcionada para convertirla en ";
+    prompt += style;
+    prompt += ". Mantén la composicion principal y la iluminacion de forma coherente. ";
+    prompt += "Este modo esta pensado para objetos, dibujos, posters y material de exposicion, no para retratos. ";
+    prompt += "Si aparecen personas, evita hacerlas identificables y transforma la escena hacia una ilustracion generica segura. ";
+    prompt += "No anadas texto legible salvo que el usuario lo haya pedido explicitamente.";
+
+    String body;
+    body.reserve(imageBase64.length() + prompt.length() + 320);
+    body += "{\"contents\":[{\"parts\":[{\"text\":";
+    appendJsonString(body, prompt);
+    body += "},{\"inline_data\":{\"mime_type\":\"image/jpeg\",\"data\":\"";
+    body += imageBase64;
+    body += "\"}}]}]}";
+    imageBase64 = "";
+
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();
+    HTTPClient http;
+    http.setTimeout(60000);
+    String url = generateContentUrl(model);
+    if (!http.begin(secureClient, url)) {
+        logLine("FAIL image edit HTTP begin");
+        return false;
+    }
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("x-goog-api-key", gSecrets.geminiApiKey);
+    int status = http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(body.c_str())), body.length());
+    body = "";
+    logLine(String("Image edit HTTP: ") + status);
+    if (status != HTTP_CODE_OK) {
+        String err = http.getString();
+        logLine(String("FAIL image edit body: ") + err.substring(0, 160));
+        http.end();
+        return false;
+    }
+
+    bool ok = extractInlineImageDataToFile(http, outputPath);
+    http.end();
+    return ok;
+}
+
+bool geminiLiveSpeakText(String text)
+{
+    text.trim();
+    if (text.isEmpty()) {
+        return false;
+    }
+
+    WiFiClientSecure client;
+    if (!openGeminiLiveWebSocket(gSecrets, client, true)) {
+        return false;
+    }
+    String instruction = "Responde en espanol con voz natural y muy breve. Eres Mika, un robot StackChan.";
+    if (!sendLiveSetup(client, gRuntimeConfig, instruction, false, false, false)) {
+        client.stop();
+        return false;
+    }
+    if (!sendLiveText(client, text.c_str())) {
+        client.stop();
+        return false;
+    }
+    LiveResponseResult response = collectLiveResponse(client, 45000, gRuntimeConfig);
+    client.stop();
+    return response.ok;
+}
+
+bool looksLikePhotoRequest(String text)
+{
+    text.toLowerCase();
+    text.replace("á", "a");
+    text.replace("é", "e");
+    text.replace("í", "i");
+    text.replace("ó", "o");
+    text.replace("ú", "u");
+    text.replace("ñ", "n");
+    text.trim();
+    bool shortPhotoUtterance = text.length() <= 36 &&
+                               (text == "foto" ||
+                                text.indexOf("una foto") >= 0 ||
+                                text.indexOf("la foto") >= 0 ||
+                                text == "haz un" ||
+                                text == "haz una" ||
+                                text == "saca un" ||
+                                text == "saca una" ||
+                                text.indexOf("foto ahora") >= 0);
+    return text.indexOf("haz una foto") >= 0 ||
+           text.indexOf("hacer una foto") >= 0 ||
+           text.indexOf("saca una foto") >= 0 ||
+           text.indexOf("toma una foto") >= 0 ||
+           shortPhotoUtterance ||
+           text.indexOf("fotografia") >= 0 ||
+           text.indexOf("camara") >= 0 ||
+           text.indexOf("haz una") >= 0 ||
+           text.indexOf("saca una") >= 0 ||
+           text.indexOf("mira") >= 0 ||
+           text.indexOf("mira esto") >= 0 ||
+           text.indexOf("describe esto") >= 0 ||
+           text.indexOf("describe esta") >= 0 ||
+           text.indexOf("que ves") >= 0 ||
+           text.indexOf("puedes ver esto") >= 0 ||
+           text.indexOf("foto de esto") >= 0;
+}
+
+bool looksLikeCancel(String text)
+{
+    text.toLowerCase();
+    return text.indexOf("cancel") >= 0 ||
+           text.indexOf("olvidalo") >= 0 ||
+           text.indexOf("olvida") >= 0 ||
+           text.indexOf("no hagas") >= 0;
+}
+
+bool runPhotoCaptureDescribeFlow()
+{
+    if (!gRuntimeConfig.imageEditEnabled || gPhotoWorkflowBusy) {
+        return false;
+    }
+    gPhotoWorkflowBusy = true;
+    bool previousReady = gReadyForVoice;
+    gReadyForVoice = false;
+    setRobotState(VisualState::Thinking);
+    setStatusColor(30, 20, 40);
+    gVisual.setExpressionFor(VisualExpression::Surprised, 1200);
+
+    bool ok = false;
+    if (WiFi.status() != WL_CONNECTED && !connectWifi(gSecrets.wifiNetworks)) {
+        drawPhotoStatus("Sin Wi-Fi", "Necesito conexion para describir y editar la imagen.");
+    } else if (capturePhotoToJpeg()) {
+        drawPhotoStatus("Analizando foto...", "No guardo imagenes de forma permanente.");
+        String descriptionPrompt =
+            "Describe en espanol, en una frase breve y neutral, lo que aparece en esta imagen. "
+            "No identifiques personas ni hagas inferencias sensibles. Si parece una persona o un menor, dilo de forma generica y recomienda usar objetos, dibujos o posters para editar.";
+        String description;
+        bool described = geminiGenerateTextFromImage(kPhotoCapturePath, descriptionPrompt, gRuntimeConfig.visionDescriptionModel, description);
+        if (!described && !gLastVisionTransportError && gRuntimeConfig.visionDescriptionModel != "gemini-2.5-flash") {
+            String firstError = gLastVisionError;
+            logLine(String("Vision retry with gemini-2.5-flash after: ") + firstError.substring(0, 80));
+            drawPhotoStatus("Reintentando Vision...", "Cambio temporal a gemini-2.5-flash.");
+            described = geminiGenerateTextFromImage(kPhotoCapturePath, descriptionPrompt, "gemini-2.5-flash", description);
+            if (!described && gLastVisionError.isEmpty()) {
+                gLastVisionError = firstError;
+            }
+        }
+        if (described) {
+            gPendingPhotoDescription = description;
+            String prompt = "Veo esto: " + description +
+                            " Ahora dime el estilo para transformarlo. Por ejemplo: comic, pixel art, cyberpunk o poster de ciberseguridad.";
+            geminiLiveSpeakText(prompt);
+            gPhotoWorkflowState = PhotoWorkflowState::AwaitingStyle;
+            ok = true;
+        } else {
+            String detail = gLastVisionError.isEmpty() ? "La foto se ha capturado, pero fallo Gemini Vision." : gLastVisionError;
+            drawPhotoStatus("No pude describirla", detail);
+            geminiLiveSpeakText("He hecho la foto, pero no he podido describirla. Prueba de nuevo con un objeto o un dibujo claro.");
+        }
+    }
+
+    gReadyForVoice = previousReady;
+    gPhotoWorkflowBusy = false;
+    setRobotState(VisualState::Idle);
+    gNextTouchStartAllowedAt = millis() + kTouchRestartCooldownMs;
+    logLine("Touch top for voice turn");
+    return ok;
+}
+
+bool runPhotoEditStyleFlow(String style)
+{
+    if (gPhotoWorkflowBusy) {
+        return false;
+    }
+    gPhotoWorkflowBusy = true;
+    bool previousReady = gReadyForVoice;
+    gReadyForVoice = false;
+    setRobotState(VisualState::Thinking);
+    setStatusColor(18, 18, 48);
+    drawPhotoStatus("Transformando...", style);
+
+    bool ok = false;
+    if (WiFi.status() != WL_CONNECTED && !connectWifi(gSecrets.wifiNetworks)) {
+        drawPhotoStatus("Sin Wi-Fi", "No puedo generar la imagen ahora.");
+    } else if (geminiEditImageToFile(kPhotoCapturePath, style, gRuntimeConfig.imageEditModel, kPhotoResultPath)) {
+        ok = displayGeneratedImage(kPhotoResultPath);
+        gVisual.setExpressionFor(VisualExpression::Happy, 1200);
+        geminiLiveSpeakText(ok ? "Listo. Te muestro la version transformada en pantalla." :
+                                "He generado la imagen, pero no he podido mostrarla bien en la pantalla.");
+    } else {
+        drawPhotoStatus("No pude generarla", "Prueba con otro estilo o una foto mas clara.");
+        geminiLiveSpeakText("No he podido generar la imagen. Prueba con otro estilo o con una foto mas clara.");
+    }
+
+    gPendingPhotoDescription = "";
+    gPhotoWorkflowState = PhotoWorkflowState::Idle;
+    gReadyForVoice = previousReady;
+    gPhotoWorkflowBusy = false;
+    setRobotState(VisualState::Idle);
+    gNextTouchStartAllowedAt = millis() + kTouchRestartCooldownMs;
+    logLine("Touch top for voice turn");
+    return ok;
+}
+
+bool handlePhotoWorkflowAfterVoice(bool voiceOk)
+{
+    if (!voiceOk || gBargeInRequested || gLastVoiceInputTranscript.isEmpty() || gPhotoWorkflowBusy) {
+        return false;
+    }
+
+    String userText = gLastVoiceInputTranscript;
+    if (gPhotoWorkflowState == PhotoWorkflowState::AwaitingStyle) {
+        if (looksLikeCancel(userText)) {
+            gPhotoWorkflowState = PhotoWorkflowState::Idle;
+            gPendingPhotoDescription = "";
+            geminiLiveSpeakText("Cancelado. No transformo la foto.");
+            return true;
+        }
+        return runPhotoEditStyleFlow(userText);
+    }
+
+    if (looksLikePhotoRequest(userText)) {
+        return runPhotoCaptureDescribeFlow();
+    }
+    return false;
 }
 
 String configuredModelName(const RuntimeConfig& config)
@@ -3048,7 +5233,7 @@ bool sendLiveSetup(
         JsonObject vad = realtimeInputConfig["automaticActivityDetection"].to<JsonObject>();
         vad["disabled"] = true;
     }
-    if (includeRobotTools && config.enableRobotTools) {
+    if (includeRobotTools && config.geminiRobotToolsEnabled) {
         JsonArray tools = setup["tools"].to<JsonArray>();
         JsonObject robotTool = tools.add<JsonObject>();
         JsonArray declarations = robotTool["functionDeclarations"].to<JsonArray>();
@@ -3070,6 +5255,7 @@ bool sendLiveSetup(
         expressionEnum.add("surprised");
         expressionEnum.add("sad");
         expressionEnum.add("angry");
+        expressionEnum.add("dizzy");
         JsonArray expressionRequired = expressionParams["required"].to<JsonArray>();
         expressionRequired.add("expression");
 
@@ -3099,6 +5285,169 @@ bool sendLiveSetup(
     }
 
     return waitLiveSetupComplete(client);
+}
+
+uint32_t fnv1aString(const String& text)
+{
+    uint32_t hash = 2166136261UL;
+    for (size_t i = 0; i < text.length(); ++i) {
+        hash ^= static_cast<uint8_t>(text[i]);
+        hash *= 16777619UL;
+    }
+    return hash;
+}
+
+String liveSessionConfigKey(const RuntimeConfig& config)
+{
+    String key;
+    key.reserve(96);
+    key += configuredModelName(config);
+    key += "|";
+    key += config.voiceName;
+    key += "|";
+    key += config.playbackMode;
+    key += "|";
+    key += config.geminiRobotToolsEnabled ? "tools1" : "tools0";
+    key += "|";
+    key += String(fnv1aString(config.systemPrompt), HEX);
+    return key;
+}
+
+void closeHotLiveSession(const char* reason)
+{
+    if (gHotLiveSessionOpen) {
+        logLine(String("Live hot close: ") + (reason != nullptr ? reason : "unknown"));
+    }
+    gHotLiveClient.stop();
+    gHotLiveSessionOpen = false;
+    gHotLiveOpenedAt = 0;
+    gHotLiveLastUsedAt = 0;
+    gHotLiveTurns = 0;
+    gHotLiveConfigKey = "";
+}
+
+bool hotLiveSessionExpired(const RuntimeConfig& config, const String& configKey, const char*& reason)
+{
+    if (!gHotLiveSessionOpen) {
+        reason = "not open";
+        return true;
+    }
+    if (!config.hotSessionEnabled) {
+        reason = "disabled";
+        return true;
+    }
+    if (WiFi.status() != WL_CONNECTED || !gHotLiveClient.connected()) {
+        reason = "disconnected";
+        return true;
+    }
+    if (gHotLiveConfigKey != configKey) {
+        reason = "config changed";
+        return true;
+    }
+
+    uint32_t now = millis();
+    uint32_t idleTimeoutMs = static_cast<uint32_t>(config.hotSessionIdleTimeoutSeconds) * 1000UL;
+    uint32_t maxAgeMs = static_cast<uint32_t>(config.hotSessionMaxAgeSeconds) * 1000UL;
+    if (gHotLiveLastUsedAt > 0 && now - gHotLiveLastUsedAt > idleTimeoutMs) {
+        reason = "idle timeout";
+        return true;
+    }
+    if (gHotLiveOpenedAt > 0 && now - gHotLiveOpenedAt > maxAgeMs) {
+        reason = "max age";
+        return true;
+    }
+    if (gHotLiveTurns >= static_cast<uint16_t>(std::max(1, config.hotSessionMaxTurns))) {
+        reason = "turn limit";
+        return true;
+    }
+    return false;
+}
+
+void serviceHotLiveSession()
+{
+    if (!gHotLiveSessionOpen || gTurnRunning) {
+        return;
+    }
+    const char* reason = nullptr;
+    String key = liveSessionConfigKey(gRuntimeConfig);
+    if (hotLiveSessionExpired(gRuntimeConfig, key, reason)) {
+        closeHotLiveSession(reason);
+    }
+}
+
+bool openHotLiveSession(const Secrets& secrets, const RuntimeConfig& config, const String& configKey)
+{
+    gHotLiveClient.stop();
+    if (!openGeminiLiveWebSocket(secrets, gHotLiveClient, false)) {
+        closeHotLiveSession("open failed");
+        return false;
+    }
+
+    String instruction = buildLiveInstruction(config, true);
+    if (!sendLiveSetup(gHotLiveClient, config, instruction, true, true)) {
+        closeHotLiveSession("setup failed");
+        return false;
+    }
+
+    uint32_t now = millis();
+    gHotLiveSessionOpen = true;
+    gHotLiveOpenedAt = now;
+    gHotLiveLastUsedAt = now;
+    gHotLiveTurns = 0;
+    gHotLiveConfigKey = configKey;
+    logLine("Live hot opened");
+    return true;
+}
+
+bool prepareLiveClient(
+    const Secrets& secrets,
+    const RuntimeConfig& config,
+    WiFiClientSecure& localClient,
+    WiFiClientSecure*& client,
+    bool& usingHotSession,
+    bool forceNewHotSession)
+{
+    usingHotSession = false;
+    client = &localClient;
+
+    if (!config.hotSessionEnabled) {
+        if (!openGeminiLiveWebSocket(secrets, localClient, false)) {
+            return false;
+        }
+        String instruction = buildLiveInstruction(config, true);
+        return sendLiveSetup(localClient, config, instruction, true, true);
+    }
+
+    String key = liveSessionConfigKey(config);
+    const char* reason = nullptr;
+    if (forceNewHotSession || hotLiveSessionExpired(config, key, reason)) {
+        if (gHotLiveSessionOpen) {
+            closeHotLiveSession(forceNewHotSession ? "forced refresh" : reason);
+        }
+        if (!openHotLiveSession(secrets, config, key)) {
+            return false;
+        }
+    } else {
+        logLine(String("Live hot reuse turns=") + gHotLiveTurns);
+    }
+
+    usingHotSession = true;
+    client = &gHotLiveClient;
+    return true;
+}
+
+bool shouldCloseHotSessionAfterTurn(String userText, const LiveResponseResult& response)
+{
+    if (!response.ok || !response.turnComplete || response.interruptedByBargeIn || response.photoRequest) {
+        return true;
+    }
+
+    userText.toLowerCase();
+    static const char* const closingWords[] = {
+        "adios", "adiós", "hasta luego", "hasta otra", "nos vemos", "ya esta", "ya está",
+        "eso es todo", "nada mas", "nada más", "gracias", "muchas gracias"
+    };
+    return containsAny(userText, closingWords, sizeof(closingWords) / sizeof(closingWords[0]));
 }
 
 bool sendLiveText(WiFiClientSecure& client, const char* text)
@@ -3179,6 +5528,8 @@ bool visualExpressionFromName(String name, VisualExpression& expression)
         expression = VisualExpression::Sad;
     } else if (name == "angry") {
         expression = VisualExpression::Angry;
+    } else if (name == "dizzy" || name == "mareado" || name == "mareada") {
+        expression = VisualExpression::Dizzy;
     } else {
         return false;
     }
@@ -3289,6 +5640,71 @@ uint32_t audioSamplesToMs(size_t samples)
     return static_cast<uint32_t>(samples * 1000ULL / kOutputSampleRate);
 }
 
+size_t audioMsToSamples(uint32_t ms)
+{
+    return static_cast<size_t>(static_cast<uint64_t>(ms) * kOutputSampleRate / 1000ULL);
+}
+
+uint32_t clampMs(uint32_t value, uint32_t lower, uint32_t upper)
+{
+    if (value < lower) {
+        return lower;
+    }
+    if (value > upper) {
+        return upper;
+    }
+    return value;
+}
+
+uint32_t elapsedBetweenMs(uint32_t startMs, uint32_t endMs)
+{
+    if (startMs == 0 || endMs == 0) {
+        return 0;
+    }
+    return endMs - startMs;
+}
+
+uint32_t estimateStopTapTailMs(bool speechDetected, uint32_t audioElapsed, uint32_t lastVoiceAudioAt, uint32_t chunkAvg)
+{
+    if (!speechDetected || lastVoiceAudioAt == 0 || audioElapsed < lastVoiceAudioAt) {
+        return kMicStopTapTailMs;
+    }
+
+    uint32_t silenceAfterVoiceMs = audioElapsed - lastVoiceAudioAt;
+    if (silenceAfterVoiceMs >= 260) {
+        return kMicStopTapMinTailMs;
+    }
+    if (silenceAfterVoiceMs >= 160 && chunkAvg <= kMicSilenceAvgThreshold) {
+        return kMicStopTapQuietTailMs;
+    }
+    return kMicStopTapTailMs;
+}
+
+uint32_t estimateDynamicPrebufferMs(uint32_t bufferedMs, uint32_t elapsedMs, uint32_t maxGapMs, uint32_t& rxRatePermille)
+{
+    if (elapsedMs == 0) {
+        rxRatePermille = 0;
+        return kPlaybackPrebufferInitialSamples * 1000UL / kOutputSampleRate;
+    }
+
+    rxRatePermille = static_cast<uint32_t>(
+        std::min<uint64_t>(9999, static_cast<uint64_t>(bufferedMs) * 1000ULL / elapsedMs));
+
+    uint32_t baseMs = 2600;
+    if (rxRatePermille >= 2400) {
+        baseMs = 900;
+    } else if (rxRatePermille >= 1800) {
+        baseMs = 1200;
+    } else if (rxRatePermille >= 1400) {
+        baseMs = 1600;
+    } else if (rxRatePermille >= 1150) {
+        baseMs = 2100;
+    }
+
+    uint32_t gapPadMs = clampMs(maxGapMs * 2, 200, 900);
+    return clampMs(baseMs + gapPadMs, kDynamicPrebufferMinMs, kDynamicPrebufferMaxMs);
+}
+
 void adjustAdaptivePrebuffer(uint32_t underruns, uint32_t audioMs)
 {
     if (audioMs < 5000) {
@@ -3316,7 +5732,11 @@ void adjustAdaptivePrebuffer(uint32_t underruns, uint32_t audioMs)
     }
 }
 
-LiveResponseResult collectLiveResponse(WiFiClientSecure& client, uint32_t timeoutMs, const RuntimeConfig& config)
+LiveResponseResult collectLiveResponse(
+    WiFiClientSecure& client,
+    uint32_t timeoutMs,
+    const RuntimeConfig& config,
+    VoiceLatencyTrace* latency)
 {
     LiveResponseResult result;
     setRobotState(VisualState::Thinking);
@@ -3327,9 +5747,18 @@ LiveResponseResult collectLiveResponse(WiFiClientSecure& client, uint32_t timeou
     gResponsePlaybackActive = true;
     size_t prebufferTargetSamples = i2sPlayback ? gAdaptivePrebufferSamples : kPlaybackPrebufferInitialSamples;
     uint32_t receiveStartedAt = millis();
+    if (latency != nullptr) {
+        latency->responseWaitStartedAt = receiveStartedAt;
+    }
     uint32_t lastResponseContentAt = receiveStartedAt;
     uint32_t firstAudioMs = 0;
+    uint32_t firstAudioAt = 0;
+    uint32_t lastAudioChunkAt = 0;
+    uint32_t maxAudioChunkGapMs = 0;
     uint32_t playbackStartMs = 0;
+    uint32_t prebufferDecisionMs = audioSamplesToMs(prebufferTargetSamples);
+    uint32_t prebufferRxPermille = 0;
+    uint32_t prebufferElapsedMs = 0;
     String inputTranscript;
     String outputTranscript;
     uint32_t samplesLogged = 0;
@@ -3338,19 +5767,25 @@ LiveResponseResult collectLiveResponse(WiFiClientSecure& client, uint32_t timeou
     bool turnComplete = false;
     StreamingAudioPlayer player;
     I2sRingAudioPlayer i2sPlayer;
+    bool thinkingSfxEligible = shouldUseThinkingSfxThisTurn(config, i2sPlayback);
+    bool thinkingSfxTried = !thinkingSfxEligible;
+    bool thinkingSfxStarted = false;
+    uint32_t thinkingSfxVisualUntil = 0;
+    uint32_t thinkingSfxUnderrunsBeforeResponse = 0;
     std::vector<int16_t> responsePcm;
     if (!streamPlayback) {
         responsePcm.reserve(240000);
     }
     std::vector<int16_t> prebufferPcm;
     if (streamPlayback) {
-        prebufferPcm.reserve(prebufferTargetSamples + kPlaybackBufferSamples);
+        prebufferPcm.reserve(kPlaybackPrebufferMaxSamples + kPlaybackBufferSamples);
     }
     bool playbackStarted = false;
     bool interruptedByBargeIn = false;
     bool stoppedByMouthTouch = false;
     bool firstResponseTimedOut = false;
     bool postAudioSilenceEnded = false;
+    bool photoRequestDetected = false;
     ResponseAffectRuntime affectRuntime;
     serviceRobot();
     bool bargeInArmed = !M5StackChan.TouchSensor.isPressed();
@@ -3374,6 +5809,101 @@ LiveResponseResult collectLiveResponse(WiFiClientSecure& client, uint32_t timeou
         }
         return true;
     };
+    auto maybeStartThinkingSfx = [&]() {
+        if (thinkingSfxTried || playbackStarted || audioParts > 0 || !outputTranscript.isEmpty()) {
+            return;
+        }
+        if (millis() - receiveStartedAt < static_cast<uint32_t>(config.thinkingSfxDelayMs)) {
+            return;
+        }
+
+        thinkingSfxTried = true;
+        LocalSfx sfx = randomThinkingSfx();
+        const char* path = localSfxPath(sfx);
+        std::vector<int16_t> pcm;
+        if (!readPcm16File(path, pcm)) {
+            return;
+        }
+
+        gPlaybackMouthLevel = 80;
+        setRobotState(VisualState::Speaking);
+        if (i2sPlayer.appendPcm(pcm)) {
+            thinkingSfxStarted = true;
+            thinkingSfxVisualUntil = millis() + audioSamplesToMs(pcm.size()) + 120;
+            gLastThinkingSfxAt = millis();
+            logLine(String("Thinking filler: ") + path);
+        } else {
+            setRobotState(VisualState::Thinking);
+        }
+    };
+    auto serviceThinkingSfxVisual = [&]() {
+        if (thinkingSfxVisualUntil > 0 && !playbackStarted && millis() >= thinkingSfxVisualUntil) {
+            thinkingSfxVisualUntil = 0;
+            gPlaybackMouthLevel = 0;
+            setRobotState(VisualState::Thinking);
+        }
+    };
+    auto startBufferedPlayback = [&]() {
+        if (playbackStarted || prebufferPcm.empty()) {
+            return false;
+        }
+        playbackStarted = true;
+        thinkingSfxVisualUntil = 0;
+        uint32_t playbackStartedAt = millis();
+        playbackStartMs = playbackStartedAt - receiveStartedAt;
+        if (latency != nullptr) {
+            latency->playbackStartedAt = playbackStartedAt;
+        }
+        gPlaybackMouthLevel = 90;
+        setRobotState(VisualState::Speaking);
+        if (affectRuntime.toolExpressionApplied) {
+            gVisual.setExpression(affectRuntime.lastExpression);
+        }
+        if (affectRuntime.predictedRefusal) {
+            applyPredictedRefusalAffect(true, affectRuntime);
+        }
+        applyResponseAffect(outputTranscript, true, affectRuntime);
+        if (thinkingSfxStarted) {
+            thinkingSfxUnderrunsBeforeResponse = i2sPlayer.underruns;
+        }
+        if (i2sPlayback) {
+            i2sPlayer.appendPcm(prebufferPcm);
+        } else {
+            player.appendPcm(prebufferPcm);
+        }
+        prebufferPcm.clear();
+        return true;
+    };
+    auto maybeStartBufferedPlayback = [&]() {
+        if (!streamPlayback || playbackStarted || prebufferPcm.empty()) {
+            return false;
+        }
+
+        uint32_t now = millis();
+        uint32_t bufferedMs = audioSamplesToMs(prebufferPcm.size());
+        uint32_t elapsedMs = firstAudioAt > 0 ? now - firstAudioAt : 0;
+        uint32_t rxPermille = 0;
+        uint32_t targetMs = audioSamplesToMs(kPlaybackPrebufferInitialSamples);
+        if (i2sPlayback) {
+            targetMs = estimateDynamicPrebufferMs(bufferedMs, elapsedMs, maxAudioChunkGapMs, rxPermille);
+            if (gAdaptivePrebufferSamples > kPlaybackPrebufferInitialSamples) {
+                targetMs = std::max<uint32_t>(targetMs, audioSamplesToMs(gAdaptivePrebufferSamples));
+            }
+        }
+
+        prebufferDecisionMs = targetMs;
+        prebufferRxPermille = rxPermille;
+        prebufferElapsedMs = elapsedMs;
+        prebufferTargetSamples = audioMsToSamples(targetMs);
+
+        if (elapsedMs < kDynamicPrebufferMinObserveMs && bufferedMs < targetMs) {
+            return false;
+        }
+        if (bufferedMs < targetMs) {
+            return false;
+        }
+        return startBufferedPlayback();
+    };
     while (millis() < deadline) {
         while (!client.available() && millis() < deadline) {
             if (checkBargeInTouch(bargeInArmed, bargeInReleasedSince, bargeInPressedSince)) {
@@ -3388,18 +5918,25 @@ LiveResponseResult collectLiveResponse(WiFiClientSecure& client, uint32_t timeou
                 firstResponseTimedOut = true;
                 break;
             }
+            maybeStartThinkingSfx();
+            serviceThinkingSfxVisual();
+            maybeStartBufferedPlayback();
             if (audioParts > 0 && playbackStarted &&
                 millis() - lastResponseContentAt >= kLivePostAudioSilenceMs) {
                 postAudioSilenceEnded = true;
                 break;
             }
             serviceRobot();
+            serviceThinkingSfxVisual();
             if (consumeMouthStop()) {
+                break;
+            }
+            if (photoRequestDetected) {
                 break;
             }
             delay(10);
         }
-        if (interruptedByBargeIn || stoppedByMouthTouch || firstResponseTimedOut || postAudioSilenceEnded) {
+        if (interruptedByBargeIn || stoppedByMouthTouch || firstResponseTimedOut || postAudioSilenceEnded || photoRequestDetected) {
             break;
         }
         if (!client.available()) {
@@ -3419,7 +5956,42 @@ LiveResponseResult collectLiveResponse(WiFiClientSecure& client, uint32_t timeou
             logLine(String("WSS sample: ") + sample);
             ++samplesLogged;
         }
-        if (config.enableRobotTools && !handleLiveToolCall(client, data, affectRuntime)) {
+        if (config.geminiRobotToolsEnabled && !handleLiveToolCall(client, data, affectRuntime)) {
+            break;
+        }
+        int inputTranscriptionPos = data.indexOf("\"inputTranscription\"");
+        if (inputTranscriptionPos >= 0) {
+            String text;
+            if (extractJsonStringAfter(data, inputTranscriptionPos, "\"text\"", text)) {
+                inputTranscript += text;
+                maybeTriggerPalomaEasterEgg(inputTranscript);
+                maybeTriggerComplimentEasterEgg(inputTranscript);
+                if (maybeTriggerChiquitoEasterEgg(inputTranscript)) {
+                    thinkingSfxTried = true;
+                }
+                if (config.imageEditEnabled && gPhotoWorkflowState == PhotoWorkflowState::Idle &&
+                    looksLikePhotoRequest(inputTranscript)) {
+                    photoRequestDetected = true;
+                    logLine(String("Live photo request detected: ") + inputTranscript.substring(0, 80));
+                    if (i2sPlayback) {
+                        i2sPlayer.requestStop();
+                    } else {
+                        M5.Speaker.stop(0);
+                    }
+                    break;
+                }
+                if (looksLikeBlockedRequest(inputTranscript)) {
+                    affectRuntime.predictedRefusal = true;
+                    requestLocalSfxThrottled(LocalSfx::SadAww, gNextDangerSfxAllowedAt, kDangerSfxCooldownMs);
+                    if (!playbackStarted) {
+                        gVisual.setExpression(VisualExpression::Sad);
+                    } else {
+                        applyPredictedRefusalAffect(true, affectRuntime);
+                    }
+                }
+            }
+        }
+        if (photoRequestDetected) {
             break;
         }
         String audioBase64;
@@ -3427,8 +5999,18 @@ LiveResponseResult collectLiveResponse(WiFiClientSecure& client, uint32_t timeou
             std::vector<int16_t> audioChunk;
             if (appendBase64Pcm16(audioBase64, audioChunk)) {
                 if (audioParts == 0) {
-                    firstAudioMs = millis() - receiveStartedAt;
+                    firstAudioAt = millis();
+                    firstAudioMs = firstAudioAt - receiveStartedAt;
+                    if (latency != nullptr) {
+                        latency->firstAudioAt = firstAudioAt;
+                    }
+                } else {
+                    uint32_t now = millis();
+                    if (lastAudioChunkAt > 0) {
+                        maxAudioChunkGapMs = std::max(maxAudioChunkGapMs, now - lastAudioChunkAt);
+                    }
                 }
+                lastAudioChunkAt = millis();
                 lastResponseContentAt = millis();
                 ++audioParts;
                 pcmSamples += audioChunk.size();
@@ -3436,25 +6018,7 @@ LiveResponseResult collectLiveResponse(WiFiClientSecure& client, uint32_t timeou
                     responsePcm.insert(responsePcm.end(), audioChunk.begin(), audioChunk.end());
                 } else if (!playbackStarted) {
                     prebufferPcm.insert(prebufferPcm.end(), audioChunk.begin(), audioChunk.end());
-                    if (prebufferPcm.size() >= prebufferTargetSamples) {
-                        playbackStarted = true;
-                        playbackStartMs = millis() - receiveStartedAt;
-                        gPlaybackMouthLevel = 90;
-                        setRobotState(VisualState::Speaking);
-                        if (affectRuntime.toolExpressionApplied) {
-                            gVisual.setExpression(affectRuntime.lastExpression);
-                        }
-                        if (affectRuntime.predictedRefusal) {
-                            applyPredictedRefusalAffect(true, affectRuntime);
-                        }
-                        applyResponseAffect(outputTranscript, playbackStarted, affectRuntime);
-                        if (i2sPlayback) {
-                            i2sPlayer.appendPcm(prebufferPcm);
-                        } else {
-                            player.appendPcm(prebufferPcm);
-                        }
-                        prebufferPcm.clear();
-                    }
+                    maybeStartBufferedPlayback();
                 } else {
                     if (i2sPlayback) {
                         i2sPlayer.appendPcm(audioChunk);
@@ -3478,22 +6042,6 @@ LiveResponseResult collectLiveResponse(WiFiClientSecure& client, uint32_t timeou
                 M5.Speaker.stop(0);
             }
             break;
-        }
-        int inputTranscriptionPos = data.indexOf("\"inputTranscription\"");
-        if (inputTranscriptionPos >= 0) {
-            String text;
-            if (extractJsonStringAfter(data, inputTranscriptionPos, "\"text\"", text)) {
-                inputTranscript += text;
-                maybeTriggerPalomaEasterEgg(inputTranscript);
-                if (looksLikeBlockedRequest(inputTranscript)) {
-                    affectRuntime.predictedRefusal = true;
-                    if (!playbackStarted) {
-                        gVisual.setExpression(VisualExpression::Sad);
-                    } else {
-                        applyPredictedRefusalAffect(true, affectRuntime);
-                    }
-                }
-            }
         }
         int transcriptionPos = data.indexOf("\"outputTranscription\"");
         if (transcriptionPos >= 0) {
@@ -3531,25 +6079,10 @@ LiveResponseResult collectLiveResponse(WiFiClientSecure& client, uint32_t timeou
     if (interruptedByBargeIn && i2sPlayback) {
         i2sPlayer.requestStop();
     }
-    if (streamPlayback && !interruptedByBargeIn && !stoppedByMouthTouch && !prebufferPcm.empty()) {
-        if (!playbackStarted) {
-            playbackStartMs = millis() - receiveStartedAt;
-        }
-        gPlaybackMouthLevel = 90;
-        setRobotState(VisualState::Speaking);
-        if (affectRuntime.toolExpressionApplied) {
-            gVisual.setExpression(affectRuntime.lastExpression);
-        }
-        if (affectRuntime.predictedRefusal) {
-            applyPredictedRefusalAffect(true, affectRuntime);
-        }
-        applyResponseAffect(outputTranscript, true, affectRuntime);
-        if (i2sPlayback) {
-            i2sPlayer.appendPcm(prebufferPcm);
-        } else {
-            player.appendPcm(prebufferPcm);
-        }
-        prebufferPcm.clear();
+    if (streamPlayback && !photoRequestDetected && !interruptedByBargeIn && !stoppedByMouthTouch && !prebufferPcm.empty()) {
+        prebufferDecisionMs = std::max<uint32_t>(prebufferDecisionMs, audioSamplesToMs(prebufferPcm.size()));
+        prebufferTargetSamples = audioMsToSamples(prebufferDecisionMs);
+        startBufferedPlayback();
     }
     if (i2sPlayback) {
         playbackOk = i2sPlayer.finish();
@@ -3558,14 +6091,22 @@ LiveResponseResult collectLiveResponse(WiFiClientSecure& client, uint32_t timeou
             gScreenMouthStopRequested = false;
         }
         uint32_t audioMs = audioSamplesToMs(pcmSamples);
-        logLine(String("I2S metrics prebuffer_ms=") + audioSamplesToMs(prebufferTargetSamples) +
+        uint32_t responseUnderruns = i2sPlayer.underruns;
+        if (thinkingSfxStarted && responseUnderruns >= thinkingSfxUnderrunsBeforeResponse) {
+            responseUnderruns -= thinkingSfxUnderrunsBeforeResponse;
+        }
+        logLine(String("I2S metrics prebuffer_ms=") + prebufferDecisionMs +
                 " first_ms=" + firstAudioMs +
                 " start_ms=" + playbackStartMs +
                 " audio_ms=" + audioMs +
+                " response_underruns=" + responseUnderruns +
+                " rx_pm=" + prebufferRxPermille +
+                " rx_elapsed_ms=" + prebufferElapsedMs +
+                " max_gap_ms=" + maxAudioChunkGapMs +
                 " low_ms=" + i2sPlayer.lowWaterMs() +
                 " high_ms=" + i2sPlayer.highWaterMs());
         if (!interruptedByBargeIn) {
-            adjustAdaptivePrebuffer(i2sPlayer.underruns, audioMs);
+            adjustAdaptivePrebuffer(responseUnderruns, audioMs);
         }
     } else if (streamPlayback) {
         playbackOk = player.finish();
@@ -3575,6 +6116,14 @@ LiveResponseResult collectLiveResponse(WiFiClientSecure& client, uint32_t timeou
         }
     } else if (!responsePcm.empty()) {
         playPcm24k(responsePcm);
+    }
+    if (latency != nullptr) {
+        logLine(String("Latency metrics stop_to_activityEnd_ms=") +
+                elapsedBetweenMs(latency->stopTapRequestedAt, latency->activityEndSentAt) +
+                " activityEnd_to_first_audio_ms=" + elapsedBetweenMs(latency->activityEndSentAt, latency->firstAudioAt) +
+                " first_audio_to_playback_ms=" + elapsedBetweenMs(latency->firstAudioAt, latency->playbackStartedAt) +
+                " stop_to_playback_ms=" + elapsedBetweenMs(latency->stopTapRequestedAt, latency->playbackStartedAt) +
+                " tail_ms=" + latency->adaptiveTailMs);
     }
     logLine(String("Live audio chunks: ") + audioParts);
     logLine(String("Live PCM samples: ") + pcmSamples);
@@ -3599,13 +6148,18 @@ LiveResponseResult collectLiveResponse(WiFiClientSecure& client, uint32_t timeou
     if (stoppedByMouthTouch) {
         logLine("Live response stopped by mouth touch");
     }
+    if (photoRequestDetected) {
+        logLine("Live response bypassed for photo workflow");
+    }
 
     gResponsePlaybackActive = previousResponsePlaybackActive;
-    result.ok = stoppedByMouthTouch || (!interruptedByBargeIn && !firstResponseTimedOut && ((audioParts > 0 && playbackOk) || outputTranscript.length() > 0));
+    result.ok = photoRequestDetected || stoppedByMouthTouch ||
+                (!interruptedByBargeIn && !firstResponseTimedOut && ((audioParts > 0 && playbackOk) || outputTranscript.length() > 0));
     result.inputTranscript = inputTranscript;
     result.outputTranscript = outputTranscript;
     result.turnComplete = turnComplete;
     result.interruptedByBargeIn = interruptedByBargeIn;
+    result.photoRequest = photoRequestDetected;
     return result;
 }
 
@@ -3655,6 +6209,8 @@ bool geminiLiveAudioTurn(const Secrets& secrets, const RuntimeConfig& config, co
     uint32_t timeoutSeconds = static_cast<uint32_t>(std::max(config.responseTimeoutSeconds, 30));
     LiveResponseResult response = collectLiveResponse(client, timeoutSeconds * 1000UL, config);
     client.stop();
+    gLastVoiceInputTranscript = response.inputTranscript;
+    gLastVoiceOutputTranscript = response.outputTranscript;
 
     if (response.ok) {
         gConversation.addTurn(response.inputTranscript, response.outputTranscript, config);
@@ -3728,8 +6284,9 @@ bool beginMicrophone()
 
     auto micConfig = M5.Mic.config();
     micConfig.sample_rate = kMicSampleRate;
-    micConfig.magnification = 32;
+    micConfig.magnification = kMicMagnification;
     micConfig.noise_filter_level = 0;
+    micConfig.stereo = kMicDirectionDiagnosticsEnabled;
     M5.Mic.config(micConfig);
 
     if (!M5.Mic.begin()) {
@@ -3741,29 +6298,136 @@ bool beginMicrophone()
     return true;
 }
 
+struct MicDirectionStats {
+    uint64_t speechLeftAbs = 0;
+    uint64_t speechRightAbs = 0;
+    uint32_t speechFrames = 0;
+    uint32_t speechChunks = 0;
+    uint64_t allLeftAbs = 0;
+    uint64_t allRightAbs = 0;
+    uint32_t allFrames = 0;
+};
+
+void updateMicDirectionStats(MicDirectionStats& stats, uint64_t leftAbs, uint64_t rightAbs, uint32_t frames, uint32_t monoAvg)
+{
+    if (frames == 0) {
+        return;
+    }
+    stats.allLeftAbs += leftAbs;
+    stats.allRightAbs += rightAbs;
+    stats.allFrames += frames;
+    if (monoAvg >= kMicSpeechAvgThreshold) {
+        stats.speechLeftAbs += leftAbs;
+        stats.speechRightAbs += rightAbs;
+        stats.speechFrames += frames;
+        ++stats.speechChunks;
+    }
+}
+
+void mergeMicDirectionStats(MicDirectionStats& target, const MicDirectionStats& source)
+{
+    target.speechLeftAbs += source.speechLeftAbs;
+    target.speechRightAbs += source.speechRightAbs;
+    target.speechFrames += source.speechFrames;
+    target.speechChunks += source.speechChunks;
+    target.allLeftAbs += source.allLeftAbs;
+    target.allRightAbs += source.allRightAbs;
+    target.allFrames += source.allFrames;
+}
+
+void finalizeMicChunk(int16_t* mono, const int16_t* stereo, size_t frames, MicDirectionStats* directionStats)
+{
+    if (!kMicDirectionDiagnosticsEnabled || stereo == nullptr) {
+        return;
+    }
+
+    uint64_t leftAbs = 0;
+    uint64_t rightAbs = 0;
+    uint64_t monoAbs = 0;
+    for (size_t i = 0; i < frames; ++i) {
+        int32_t left = stereo[i * 2];
+        int32_t right = stereo[i * 2 + 1];
+        int32_t mixed = (left + right) / 2;
+        mono[i] = static_cast<int16_t>(std::max<int32_t>(INT16_MIN, std::min<int32_t>(INT16_MAX, mixed)));
+        leftAbs += static_cast<uint32_t>(abs(left));
+        rightAbs += static_cast<uint32_t>(abs(right));
+        monoAbs += static_cast<uint32_t>(abs(mixed));
+    }
+
+    if (directionStats != nullptr) {
+        uint32_t monoAvg = frames > 0 ? static_cast<uint32_t>(monoAbs / frames) : 0;
+        updateMicDirectionStats(*directionStats, leftAbs, rightAbs, static_cast<uint32_t>(frames), monoAvg);
+    }
+}
+
+bool queueMicChunk(int16_t* mono, int16_t* stereo, size_t frames, uint32_t sampleRate)
+{
+    memset(mono, 0, frames * sizeof(int16_t));
+    if (kMicDirectionDiagnosticsEnabled) {
+        if (stereo == nullptr) {
+            return false;
+        }
+        memset(stereo, 0, frames * 2 * sizeof(int16_t));
+        return M5.Mic.record(stereo, frames * 2, sampleRate, true);
+    }
+    return M5.Mic.record(mono, frames, sampleRate);
+}
+
+void logMicDirectionStats(const MicDirectionStats& stats)
+{
+    uint32_t frames = stats.speechFrames > 0 ? stats.speechFrames : stats.allFrames;
+    uint64_t leftAbs = stats.speechFrames > 0 ? stats.speechLeftAbs : stats.allLeftAbs;
+    uint64_t rightAbs = stats.speechFrames > 0 ? stats.speechRightAbs : stats.allRightAbs;
+    if (frames == 0) {
+        logLine("Mic stereo dir: no_samples");
+        return;
+    }
+
+    uint32_t leftAvg = static_cast<uint32_t>(leftAbs / frames);
+    uint32_t rightAvg = static_cast<uint32_t>(rightAbs / frames);
+    uint64_t denom = leftAbs + rightAbs;
+    int32_t diffPermille = denom > 0 ? static_cast<int32_t>((static_cast<int64_t>(rightAbs) - static_cast<int64_t>(leftAbs)) * 1000 / static_cast<int64_t>(denom)) : 0;
+    const char* side = "center";
+    if (diffPermille > kMicDirectionDeadzonePermille) {
+        side = "right_channel";
+    } else if (diffPermille < -kMicDirectionDeadzonePermille) {
+        side = "left_channel";
+    }
+    logLine(String("Mic stereo dir L/R/diff_pm/side/chunks: ") +
+            leftAvg + "/" + rightAvg + "/" + diffPermille + "/" + side + "/" + stats.speechChunks);
+}
+
 struct MicPrerollCapture {
     int16_t* samples = nullptr;
     size_t capacitySamples = 0;
     volatile size_t sampleCount = 0;
     volatile bool stopRequested = false;
     volatile bool failed = false;
+    volatile bool finished = false;
     TaskHandle_t task = nullptr;
     SemaphoreHandle_t done = nullptr;
+    SemaphoreHandle_t dataReady = nullptr;
+    MicDirectionStats directionStats;
     uint32_t chunkTimeoutMs = static_cast<uint32_t>(kMicStreamChunkSamples * 1000ULL / kMicSampleRate) + 250;
 };
 
 void micPrerollTask(void* arg)
 {
     auto* capture = static_cast<MicPrerollCapture*>(arg);
+    int16_t stereoScratch[kMicStreamChunkSamples * 2];
     while (!capture->stopRequested && capture->sampleCount + kMicStreamChunkSamples <= capture->capacitySamples) {
         int16_t* dst = capture->samples + capture->sampleCount;
-        memset(dst, 0, kMicStreamChunkSamples * sizeof(int16_t));
-        if (!M5.Mic.record(dst, kMicStreamChunkSamples, kMicSampleRate) || !waitMicIdleFromTask(capture->chunkTimeoutMs)) {
+        if (!queueMicChunk(dst, stereoScratch, kMicStreamChunkSamples, kMicSampleRate) || !waitMicIdleFromTask(capture->chunkTimeoutMs)) {
             capture->failed = true;
             break;
         }
+        finalizeMicChunk(dst, stereoScratch, kMicStreamChunkSamples, &capture->directionStats);
         capture->sampleCount += kMicStreamChunkSamples;
+        if (capture->dataReady != nullptr) {
+            xSemaphoreGive(capture->dataReady);
+        }
     }
+    capture->finished = true;
     xSemaphoreGive(capture->done);
     vTaskDelete(nullptr);
 }
@@ -3777,7 +6441,8 @@ bool startMicPreroll(MicPrerollCapture& capture)
         capture.samples = static_cast<int16_t*>(heap_caps_malloc(bytes, MALLOC_CAP_8BIT));
     }
     capture.done = xSemaphoreCreateBinary();
-    if (capture.samples == nullptr || capture.done == nullptr) {
+    capture.dataReady = xSemaphoreCreateBinary();
+    if (capture.samples == nullptr || capture.done == nullptr || capture.dataReady == nullptr) {
         logLine("FAIL mic preroll alloc");
         if (capture.samples != nullptr) {
             heap_caps_free(capture.samples);
@@ -3786,6 +6451,10 @@ bool startMicPreroll(MicPrerollCapture& capture)
         if (capture.done != nullptr) {
             vSemaphoreDelete(capture.done);
             capture.done = nullptr;
+        }
+        if (capture.dataReady != nullptr) {
+            vSemaphoreDelete(capture.dataReady);
+            capture.dataReady = nullptr;
         }
         return false;
     }
@@ -3797,6 +6466,8 @@ bool startMicPreroll(MicPrerollCapture& capture)
         capture.samples = nullptr;
         vSemaphoreDelete(capture.done);
         capture.done = nullptr;
+        vSemaphoreDelete(capture.dataReady);
+        capture.dataReady = nullptr;
         return false;
     }
     return true;
@@ -3820,76 +6491,80 @@ void cleanupMicPreroll(MicPrerollCapture& capture)
         vSemaphoreDelete(capture.done);
         capture.done = nullptr;
     }
+    if (capture.dataReady != nullptr) {
+        vSemaphoreDelete(capture.dataReady);
+        capture.dataReady = nullptr;
+    }
     capture.task = nullptr;
 }
 
-bool geminiLiveStreamingAudioTurn(const Secrets& secrets, const RuntimeConfig& config, bool touchReleaseModeRequested)
+bool geminiLiveStreamingAudioTurn(const Secrets& secrets, const RuntimeConfig& config)
 {
-    logLine("Mic streaming: preroll");
+    logLine("Mic streaming: continuous");
     if (!beginMicrophone()) {
         return false;
     }
 
-    MicPrerollCapture preroll;
-    if (!startMicPreroll(preroll)) {
+    MicPrerollCapture capture;
+    if (!startMicPreroll(capture)) {
         finishMicrophone();
         return false;
     }
 
-    WiFiClientSecure client;
-    if (!openGeminiLiveWebSocket(secrets, client, false)) {
-        stopMicPreroll(preroll);
-        cleanupMicPreroll(preroll);
+    WiFiClientSecure localClient;
+    WiFiClientSecure* client = nullptr;
+    bool usingHotSession = false;
+    VoiceLatencyTrace latency;
+    if (!prepareLiveClient(secrets, config, localClient, client, usingHotSession, false)) {
+        stopMicPreroll(capture);
+        cleanupMicPreroll(capture);
         finishMicrophone();
+        localClient.stop();
         return false;
     }
 
-    String instruction = buildLiveInstruction(config, true);
-    if (!sendLiveSetup(client, config, instruction, true, true)) {
-        stopMicPreroll(preroll);
-        cleanupMicPreroll(preroll);
-        finishMicrophone();
-        client.stop();
-        return false;
+    if (!sendLiveActivityStart(*client)) {
+        if (usingHotSession) {
+            closeHotLiveSession("activityStart failed");
+            if (prepareLiveClient(secrets, config, localClient, client, usingHotSession, true)) {
+                logLine("Live hot retry with fresh session");
+            }
+        }
+        if (client == nullptr || !sendLiveActivityStart(*client)) {
+            stopMicPreroll(capture);
+            cleanupMicPreroll(capture);
+            finishMicrophone();
+            localClient.stop();
+            if (usingHotSession) {
+                closeHotLiveSession("activityStart retry failed");
+            }
+            return false;
+        }
     }
 
-    if (!sendLiveActivityStart(client)) {
-        stopMicPreroll(preroll);
-        cleanupMicPreroll(preroll);
-        finishMicrophone();
-        client.stop();
-        return false;
-    }
-
-    stopMicPreroll(preroll);
     serviceRobot();
-    logLine(String("Mic preroll ms: ") + static_cast<uint32_t>(preroll.sampleCount * 1000ULL / kMicSampleRate));
-
-    int16_t buffers[2][kMicStreamChunkSamples];
-    memset(buffers, 0, sizeof(buffers));
-    int current = 0;
-    int next = 1;
-    uint32_t chunkTimeoutMs = static_cast<uint32_t>(kMicStreamChunkSamples * 1000ULL / kMicSampleRate) + 250;
+    logLine(String("Mic capture buffered ms: ") + static_cast<uint32_t>(capture.sampleCount * 1000ULL / kMicSampleRate));
 
     bool speechDetected = false;
-    bool touchReleaseMode = touchReleaseModeRequested;
-    bool releasedBeforeStream = touchReleaseMode && !topTouchActiveDuring(kTouchReleaseConfirmMs);
-    if (releasedBeforeStream) {
-        logLine("Mic touch released before stream loop; using preroll");
-    }
-    bool endedByTouchRelease = false;
+    bool endedByStopTap = false;
     bool endedBySilence = false;
     bool endedByNoSpeech = false;
     bool endedByMax = false;
+    bool transportFailed = false;
     size_t totalSamples = 0;
+    size_t readOffset = 0;
     uint32_t chunks = 0;
     uint32_t peak = 0;
     uint64_t sum = 0;
-    uint32_t startedAt = millis();
-    uint32_t lastVoiceAt = startedAt;
-    uint32_t touchInactiveSince = releasedBeforeStream ? startedAt : 0;
+    uint32_t lastVoiceAudioAt = 0;
+    bool stopTapArmed = false;
+    bool stopRequested = false;
+    uint32_t stopTapReleasedSince = 0;
+    uint32_t stopTapPressedSince = 0;
+    uint32_t stopRequestedAudioAt = 0;
+    uint32_t stopTapTailMs = kMicStopTapTailMs;
     uint32_t sendMs = 0;
-    logLine(String("Mic touch mode: ") + (touchReleaseMode ? "release" : "silence"));
+    logLine("Mic mode: tap-to-stop");
 
     auto observeSamples = [&](const int16_t* data, size_t count) {
         uint32_t chunkAvg = computeChunkAverage(data, count);
@@ -3902,152 +6577,183 @@ bool geminiLiveStreamingAudioTurn(const Secrets& secrets, const RuntimeConfig& c
             sum += static_cast<uint32_t>(value);
         }
         totalSamples += count;
+        uint32_t audioElapsed = static_cast<uint32_t>(totalSamples * 1000ULL / kMicSampleRate);
         if (chunkAvg >= kMicSpeechAvgThreshold) {
             speechDetected = true;
-            lastVoiceAt = millis();
+            lastVoiceAudioAt = audioElapsed;
+        }
+        return chunkAvg;
+    };
+
+    auto updateStopTap = [&](uint32_t now, uint32_t audioElapsed) {
+        bool rawTouch = rawTopTouchActive();
+        if (!stopTapArmed) {
+            if (!rawTouch) {
+                if (stopTapReleasedSince == 0) {
+                    stopTapReleasedSince = now;
+                }
+                if (now - stopTapReleasedSince >= kMicStopTapArmReleaseMs) {
+                    stopTapArmed = true;
+                    logLine("Mic stop tap armed");
+                }
+            } else {
+                stopTapReleasedSince = 0;
+            }
+            return;
+        }
+
+        if (stopRequested) {
+            return;
+        }
+
+        if (rawTouch) {
+            if (stopTapPressedSince == 0) {
+                stopTapPressedSince = now;
+            }
+            if (now - stopTapPressedSince >= kMicStopTapHoldMs) {
+                stopRequested = true;
+                stopRequestedAudioAt = audioElapsed;
+                latency.stopTapUsed = true;
+                latency.stopTapRequestedAt = now;
+                latency.adaptiveTailMs = stopTapTailMs;
+                logLine("Mic stop tap requested");
+                setStatusColor(0, 8, 40);
+            }
+        } else {
+            stopTapPressedSince = 0;
         }
     };
 
-    bool currentChunkQueued = false;
-    if (!releasedBeforeStream) {
-        if (!M5.Mic.record(buffers[current], kMicStreamChunkSamples, kMicSampleRate)) {
-            logLine("FAIL mic first stream chunk");
-            cleanupMicPreroll(preroll);
-            finishMicrophone();
-            sendLiveActivityEnd(client);
-            client.stop();
-            return false;
+    while (true) {
+        while (readOffset >= capture.sampleCount && !capture.finished && !capture.failed) {
+            uint32_t audioElapsed = static_cast<uint32_t>(readOffset * 1000ULL / kMicSampleRate);
+            updateStopTap(millis(), audioElapsed);
+            serviceRobot();
+            if (capture.dataReady != nullptr) {
+                xSemaphoreTake(capture.dataReady, pdMS_TO_TICKS(20));
+            } else {
+                delay(10);
+            }
         }
-        currentChunkQueued = true;
-    }
 
-    size_t prerollOffset = 0;
-    while (prerollOffset < preroll.sampleCount) {
-        size_t count = std::min(kMicStreamChunkSamples, preroll.sampleCount - prerollOffset);
-        uint32_t sendStart = millis();
-        if (!sendLiveAudioChunk(client, preroll.samples + prerollOffset, count)) {
-            logLine("FAIL Live preroll audio send");
-            waitMicIdle(chunkTimeoutMs);
-            cleanupMicPreroll(preroll);
-            finishMicrophone();
-            client.stop();
-            return false;
+        if (capture.failed) {
+            logLine("FAIL mic continuous capture");
+            transportFailed = true;
+            break;
         }
-        sendMs += millis() - sendStart;
-        observeSamples(preroll.samples + prerollOffset, count);
-        ++chunks;
-        prerollOffset += count;
-    }
-    cleanupMicPreroll(preroll);
-    if (totalSamples > 0) {
-        startedAt = millis() - static_cast<uint32_t>(totalSamples * 1000ULL / kMicSampleRate);
-    }
-
-    if (currentChunkQueued && !waitMicIdle(chunkTimeoutMs)) {
-        logLine("FAIL mic first stream wait");
-        finishMicrophone();
-        sendLiveActivityEnd(client);
-        client.stop();
-        return false;
-    }
-
-    if (releasedBeforeStream) {
-        endedByTouchRelease = true;
-    }
-
-    while (!releasedBeforeStream) {
-        uint32_t chunkAvg = computeChunkAverage(buffers[current], kMicStreamChunkSamples);
-        observeSamples(buffers[current], kMicStreamChunkSamples);
-        uint32_t now = millis();
-        uint32_t elapsed = now - startedAt;
-
-        serviceRobot();
-        bool touchActive = topTouchActive();
-        if (!touchReleaseMode && elapsed >= kMicTouchReleaseGraceMs && touchActive) {
-            touchReleaseMode = true;
-        }
-        if (touchActive) {
-            touchInactiveSince = 0;
-        } else if (touchInactiveSince == 0) {
-            touchInactiveSince = now;
-        }
-        bool touchReleasedStable = touchInactiveSince != 0 && now - touchInactiveSince >= kTouchReleaseConfirmMs;
-
-        bool shouldStop = false;
-        if (touchReleaseMode && elapsed >= kMicMinRecordMs && touchReleasedStable) {
-            endedByTouchRelease = true;
-            shouldStop = true;
-        } else if (!touchReleaseMode && speechDetected && elapsed >= kMicMinRecordMs && chunkAvg <= kMicSilenceAvgThreshold &&
-                   now - lastVoiceAt >= kMicSilenceEndMs) {
-            endedBySilence = true;
-            shouldStop = true;
-        } else if (!touchReleaseMode && !speechDetected && elapsed >= kMicNoSpeechTimeoutMs) {
-            endedByNoSpeech = true;
-            shouldStop = true;
-        } else if (elapsed >= kMicMaxRecordMs) {
+        if (readOffset >= capture.sampleCount) {
             endedByMax = true;
-            shouldStop = true;
+            break;
         }
 
-        bool nextQueued = false;
-        if (!shouldStop) {
-            memset(buffers[next], 0, kMicStreamChunkSamples * sizeof(int16_t));
-            nextQueued = M5.Mic.record(buffers[next], kMicStreamChunkSamples, kMicSampleRate);
-            if (!nextQueued) {
-                logLine("FAIL mic stream queue");
-                shouldStop = true;
-            }
-        }
-
+        size_t count = std::min(kMicStreamChunkSamples, capture.sampleCount - readOffset);
         uint32_t sendStart = millis();
-        if (!sendLiveAudioChunk(client, buffers[current], kMicStreamChunkSamples)) {
+        if (!sendLiveAudioChunk(*client, capture.samples + readOffset, count)) {
             logLine("FAIL Live streaming audio send");
-            if (nextQueued) {
-                waitMicIdle(chunkTimeoutMs);
-            }
-            finishMicrophone();
-            client.stop();
-            return false;
+            transportFailed = true;
+            break;
         }
         sendMs += millis() - sendStart;
         ++chunks;
 
-        if (shouldStop) {
+        uint32_t chunkAvg = observeSamples(capture.samples + readOffset, count);
+        readOffset += count;
+        uint32_t now = millis();
+        uint32_t audioElapsed = static_cast<uint32_t>(totalSamples * 1000ULL / kMicSampleRate);
+        serviceRobot();
+        updateStopTap(now, audioElapsed);
+
+        if (stopRequested) {
+            stopTapTailMs = estimateStopTapTailMs(speechDetected, audioElapsed, lastVoiceAudioAt, chunkAvg);
+            latency.adaptiveTailMs = stopTapTailMs;
+        }
+        bool stopTapTailDone = stopRequested && audioElapsed >= stopRequestedAudioAt + stopTapTailMs;
+        if (audioElapsed >= kMicMinRecordMs && stopTapTailDone) {
+            endedByStopTap = true;
             break;
         }
-        if (!waitMicIdle(chunkTimeoutMs)) {
-            logLine("FAIL mic stream wait");
+        if (speechDetected && audioElapsed >= kMicMinRecordMs && chunkAvg <= kMicSilenceAvgThreshold &&
+            audioElapsed - lastVoiceAudioAt >= kMicSilenceEndMs) {
+            endedBySilence = true;
             break;
         }
-        std::swap(current, next);
+        if (!speechDetected && audioElapsed >= kMicNoSpeechTimeoutMs) {
+            endedByNoSpeech = true;
+            break;
+        }
+        if (audioElapsed >= kMicMaxRecordMs) {
+            endedByMax = true;
+            break;
+        }
     }
 
+    stopMicPreroll(capture);
+    MicDirectionStats directionStats;
+    mergeMicDirectionStats(directionStats, capture.directionStats);
+    bool activityEnded = client != nullptr && sendLiveActivityEnd(*client);
+    if (activityEnded) {
+        latency.activityEndSentAt = millis();
+    }
     finishMicrophone();
     setRobotState(VisualState::Thinking);
-    if (!sendLiveActivityEnd(client)) {
-        client.stop();
-        return false;
-    }
 
     uint32_t avg = totalSamples > 0 ? static_cast<uint32_t>(sum / totalSamples) : 0;
-    String reason = endedByTouchRelease ? "touch" : endedBySilence ? "silence" : endedByNoSpeech ? "no_speech" : endedByMax ? "max" : "error";
+    String reason = endedByStopTap ? "stop_tap" : endedBySilence ? "silence" : endedByNoSpeech ? "no_speech" : endedByMax ? "max" : "error";
     logLine(String("Live mic chunks streamed: ") + chunks);
     logLine(String("Mic stream ms/reason: ") + static_cast<uint32_t>(totalSamples * 1000ULL / kMicSampleRate) + "/" + reason);
+    logLine(String("Mic capture total_ms: ") + static_cast<uint32_t>(capture.sampleCount * 1000ULL / kMicSampleRate));
     logLine(String("Mic stream send_ms: ") + sendMs);
     logLine(String("Mic peak/avg: ") + peak + "/" + avg);
+    if (latency.stopTapUsed) {
+        logLine(String("Mic stop tail ms: ") + latency.adaptiveTailMs);
+    }
+    if (kMicDirectionDiagnosticsEnabled) {
+        logMicDirectionStats(directionStats);
+    }
+    cleanupMicPreroll(capture);
+
+    if (!activityEnded || transportFailed) {
+        if (usingHotSession) {
+            closeHotLiveSession(!activityEnded ? "activityEnd failed" : "transport failed");
+        } else {
+            localClient.stop();
+        }
+        return false;
+    }
 
     if (!speechDetected) {
         logLine("No speech detected; skipping response wait");
-        client.stop();
+        if (usingHotSession) {
+            gHotLiveLastUsedAt = millis();
+        } else {
+            localClient.stop();
+        }
         return true;
     }
 
     uint32_t timeoutSeconds = static_cast<uint32_t>(std::max(config.responseTimeoutSeconds, 30));
-    LiveResponseResult response = collectLiveResponse(client, timeoutSeconds * 1000UL, config);
-    client.stop();
+    LiveResponseResult response = collectLiveResponse(*client, timeoutSeconds * 1000UL, config, &latency);
+    gLastVoiceInputTranscript = response.inputTranscript;
+    gLastVoiceOutputTranscript = response.outputTranscript;
 
     if (response.ok) {
         gConversation.addTurn(response.inputTranscript, response.outputTranscript, config);
+    }
+    if (usingHotSession) {
+        bool closeAfterTurn = shouldCloseHotSessionAfterTurn(response.inputTranscript, response);
+        if (!closeAfterTurn) {
+            ++gHotLiveTurns;
+            gHotLiveLastUsedAt = millis();
+            if (gHotLiveTurns >= static_cast<uint16_t>(std::max(1, config.hotSessionMaxTurns))) {
+                closeHotLiveSession("turn limit");
+            } else {
+                logLine(String("Live hot keep turns=") + gHotLiveTurns);
+            }
+        } else {
+            closeHotLiveSession(response.turnComplete ? "conversation close" : "turn incomplete");
+        }
+    } else {
+        localClient.stop();
     }
     logLine(String("Conversation turns: ") + gConversation.turns.size());
     logLine(response.ok ? "OK Live streaming voice turn" : "FAIL Live streaming voice turn");
@@ -4154,18 +6860,22 @@ bool recordMicrophonePcm(int16_t*& samples, size_t& sampleCount)
     return sampleCount > 0;
 }
 
-void runVoiceTurn(bool touchReleaseMode)
+void runVoiceTurn()
 {
     if (gTurnRunning) {
         return;
     }
     gTurnRunning = true;
     gBargeInRequested = false;
+    gLastVoiceInputTranscript = "";
+    gLastVoiceOutputTranscript = "";
+    gVisual.resumeDrawing();
     setStatusColor(40, 24, 0);
     serviceRobot();
 
     if (WiFi.status() != WL_CONNECTED) {
         logLine("WiFi reconnect...");
+        closeHotLiveSession("wifi reconnect");
         if (!connectWifi(gSecrets.wifiNetworks)) {
             setStatusColor(40, 0, 0);
             setRobotState(VisualState::Error);
@@ -4178,7 +6888,7 @@ void runVoiceTurn(bool touchReleaseMode)
         syncClock();
     }
 
-    bool ok = geminiLiveStreamingAudioTurn(gSecrets, gRuntimeConfig, touchReleaseMode);
+    bool ok = geminiLiveStreamingAudioTurn(gSecrets, gRuntimeConfig);
     if (gBargeInRequested) {
         setStatusColor(40, 24, 0);
         setRobotState(VisualState::Listening);
@@ -4192,6 +6902,7 @@ void runVoiceTurn(bool touchReleaseMode)
     gNextTouchStartAllowedAt = millis() + kTouchRestartCooldownMs;
     gTouchLevelStartArmed = false;
     gTouchLevelActiveSince = 0;
+    handlePhotoWorkflowAfterVoice(ok);
 }
 
 void printHeap()
@@ -4212,6 +6923,17 @@ void setup()
     M5StackChan.begin();
     gGestures.begin();
     gVisual.begin();
+    if (gImuReactions.begin()) {
+        logLine("OK IMU reactions");
+    } else {
+        logLine("WARN IMU unavailable");
+    }
+    if (kAmbientPresenceEnabled) {
+        gAmbientPresence.begin();
+    } else {
+        logLine("Ambient presence: off");
+    }
+    gNfcReady = beginNfcDiagnostics();
     if (!kVisualFaceEnabled || !gVisual.isReady()) {
         M5StackChan.Display().setTextSize(1);
         M5StackChan.Display().setTextScroll(true);
@@ -4255,6 +6977,7 @@ void setup()
 
     gReadyForVoice = true;
     setRobotState(VisualState::Idle);
+    gImuReactions.recalibrate(2500);
     gNextTouchStartAllowedAt = millis() + kTouchRestartCooldownMs;
     gTouchLevelStartArmed = false;
     gTouchLevelActiveSince = 0;
@@ -4266,6 +6989,7 @@ void setup()
 void loop()
 {
     serviceRobot();
+    serviceHotLiveSession();
     uint32_t now = millis();
     handleScreenCheekTouch(now);
 
@@ -4286,14 +7010,22 @@ void loop()
                            now - gTouchLevelActiveSince >= kTouchStartHoldMs;
     bool startRequested = gAutoStartVoiceTurn || (!cooldownActive && touchLevelStart);
     if (gReadyForVoice && !gTurnRunning && startRequested) {
-        bool touchReleaseMode = gAutoStartVoiceTurn
-                                    ? (gNextTurnTouchReleaseMode || touchActive)
-                                    : touchActive;
         gTouchLevelStartArmed = false;
         gAutoStartVoiceTurn = false;
-        gNextTurnTouchReleaseMode = false;
-        runVoiceTurn(touchReleaseMode);
+        runVoiceTurn();
     }
+    if (kAmbientPresenceEnabled) {
+        bool ambientAllowed = gReadyForVoice &&
+                              !gTurnRunning &&
+                              !gResponsePlaybackActive &&
+                              !gPhotoWorkflowBusy &&
+                              !gLocalSfxPlaying &&
+                              gPendingLocalSfx == LocalSfx::None &&
+                              !gGestures.isBusy() &&
+                              !rawTouchActive;
+        gAmbientPresence.update(ambientAllowed);
+    }
+    processNfcDiagnostics();
     processPendingLocalSfx();
     delay(50);
 }
