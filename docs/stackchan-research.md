@@ -2,6 +2,8 @@
 
 Fecha de investigacion: 2026-05-15
 
+Nota: este documento conserva investigacion, pruebas y decisiones historicas. La referencia actual del firmware implementado esta en `docs/firmware.md`. Algunas secciones antiguas de pruebas pueden mencionar valores o modos que ya han cambiado.
+
 ## Identificacion local
 
 El robot conectado por USB aparece en Linux como:
@@ -246,7 +248,9 @@ Prueba local validada el 2026-05-15:
 
 Nota importante: aunque la pagina raw WebSocket actual muestra un ejemplo con clave superior `config`, en la prueba real de este entorno el servidor cerro la conexion con ese formato. El firmware debe implementar inicialmente la variante comprobada `setup` + `generationConfig` y mantener esta capa aislada para poder adaptarla si Google cambia el protocolo.
 
-Prueba en StackChan K151 validada el 2026-05-15:
+Prueba inicial en StackChan K151 validada el 2026-05-15:
+
+Estas notas describen el primer camino que funciono. El firmware actual ya no usa grabacion fija de 5 s ni `M5.Speaker.playRaw()` para las respuestas principales; la referencia vigente esta en `docs/firmware.md`.
 
 - Firmware PlatformIO/Arduino flasheado correctamente en `/dev/ttyACM0`.
 - LittleFS subido con `/secrets.json`.
@@ -266,22 +270,22 @@ Prueba en StackChan K151 validada el 2026-05-15:
   - `setupComplete` recibido.
   - respuesta de audio recibida en frames WebSocket binarios con JSON textual.
   - 12 chunks `inlineData.data` detectados en la prueba final.
-- Audio de salida:
+- Audio de salida probado inicialmente:
   - `inlineData.data` se extrae del JSON textual recibido en frames binarios.
   - base64 decodificado en firmware con `mbedtls_base64_decode`.
   - PCM 16-bit little-endian convertido a `int16_t`.
   - reproduccion por `M5.Speaker.playRaw(..., 24000, mono)`.
   - prueba posterior: 10 chunks de audio, 33841 muestras PCM, `OK audio queued`, `Audio playback done`.
-- Turno de voz por touch:
+- Turno de voz por touch probado inicialmente:
   - toque superior detectado con `M5StackChan.TouchSensor`.
   - microfono grabado durante 5 s a 16 kHz mono.
   - microfono y altavoz no se usan simultaneamente: `Speaker.end()` antes de `Mic.begin()` y vuelta a `Speaker.begin()` antes de reproducir.
   - Live configurado con `realtimeInputConfig.automaticActivityDetection.disabled = true`.
   - el firmware manda `activityStart`, chunks `realtimeInput.audio` de 20 ms y `activityEnd`.
-  - `settings,playback_mode` controla la salida de audio:
-    - `buffered`: espera a recibir el audio completo y lo reproduce con `playRaw` de una sola vez. Es el modo por defecto porque suena estable.
-    - `streaming`: modo experimental; hace prebuffer de 2 s y luego envia buffers de 1 s al altavoz mientras llegan frames WebSocket. En la prueba real se entrecorta porque `M5.Speaker.playRaw()` introduce discontinuidades al encadenar muchos buffers.
-    - `i2s`: modo streaming de mayor calidad. Usa el driver I2S STD directo sobre CoreS3 (`I2S_NUM_1`, BCLK GPIO34, WS GPIO33, DOUT GPIO13), una tarea FreeRTOS y una cola de bloques PCM; evita encadenar `M5.Speaker.playRaw()`.
+  - `settings,playback_mode` evoluciono durante las pruebas:
+    - `buffered`: historico; esperaba a recibir el audio completo y lo reproducia con `playRaw`.
+    - `streaming`: historico/experimental; hacia prebuffer y encadenaba `playRaw`, pero se entrecortaba.
+    - `i2s`: modo vigente recomendado. Usa el driver I2S STD directo sobre CoreS3 (`I2S_NUM_1`, BCLK GPIO34, WS GPIO33, DOUT GPIO13), una tarea FreeRTOS y ring buffer PCM; evita encadenar `M5.Speaker.playRaw()`.
   - `settings,max_answer_seconds` queda como objetivo de brevedad del prompt, no como corte duro. El corte tecnico separado es `settings,response_timeout_seconds`, por defecto 90 s.
   - se fuerza pronunciacion de GSEC en el prompt fijo: `GSEC` debe decirse como `yisec`, sonando `yi-sec`.
   - prueba real: entrada transcrita como `¿Qué es un virus?`, 71 chunks de audio, 322082 muestras PCM, `Audio playback done`, `OK Live voice turn`.
