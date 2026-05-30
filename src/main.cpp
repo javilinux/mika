@@ -32,10 +32,10 @@ constexpr uint32_t kMicSampleRate = 16000;
 constexpr uint32_t kMicMaxRecordMs = 12000;
 constexpr uint32_t kMicMinRecordMs = 700;
 constexpr uint32_t kMicTouchReleaseGraceMs = 500;
-constexpr uint32_t kMicSilenceEndMs = 900;
+constexpr uint32_t kMicSilenceEndMs = 1200;
 constexpr uint32_t kMicNoSpeechTimeoutMs = 3500;
-constexpr uint32_t kMicSpeechAvgThreshold = 900;
-constexpr uint32_t kMicSilenceAvgThreshold = 550;
+constexpr uint32_t kMicSpeechAvgThreshold = 2500;
+constexpr uint32_t kMicSilenceAvgThreshold = 1500;
 constexpr uint32_t kLiveFirstResponseTimeoutMs = 18000;
 constexpr uint32_t kLivePostAudioSilenceMs = 7000;
 constexpr uint32_t kTouchRestartCooldownMs = 900;
@@ -70,7 +70,7 @@ constexpr int kServoYawThinking = -50;
 constexpr int kServoPitchThinking = 120;
 constexpr int kServoPitchError = 60;
 constexpr int kServoGestureSpeed = 180;
-constexpr uint16_t kTopTouchIntensityThreshold = 8;
+constexpr uint16_t kTopTouchIntensityThreshold = 1;
 constexpr uint8_t kMicMagnification = 8;
 constexpr size_t kAudioChunkSamples = 320;  // 20 ms at 16 kHz.
 constexpr size_t kMicStreamChunkSamples = 640;  // 40 ms at 16 kHz.
@@ -847,6 +847,26 @@ private:
         canvas->fillCircle(254, 143, radius, blush);
     }
 
+    void drawChicuiBranding()
+    {
+        // Fondo verde Unicaja
+        uint16_t unicajaGreen = rgb565(0, 107, 63);
+        
+        // Etiqueta inferior con el nombre
+        canvas->fillRoundRect(100, 205, 120, 28, 8, unicajaGreen);
+        canvas->setTextColor(TFT_WHITE);
+        canvas->setTextDatum(middle_center);
+        canvas->setFont(&fonts::FreeSansBoldOblique12pt7b);
+        canvas->drawString("CHICUI", 160, 220);
+
+        // Mini escudo/logo Unicaja (representación geométrica)
+        // Un círculo blanco con una "U" verde
+        canvas->fillCircle(20, 220, 15, TFT_WHITE);
+        canvas->setTextColor(unicajaGreen);
+        canvas->setFont(&fonts::FreeSansBold9pt7b);
+        canvas->drawString("U", 20, 221);
+    }
+
     void draw(uint32_t now)
     {
         canvas->fillScreen(TFT_BLACK);
@@ -883,7 +903,7 @@ private:
         uint8_t mouth = state == VisualState::Speaking ? smoothedMouth(gPlaybackMouthLevel) : 0;
         drawMouth(163, 148 + breathY, mouth);
         drawPalomaOverlay(now);
-
+        drawChicuiBranding();
         canvas->pushSprite(0, 0);
     }
 };
@@ -1874,9 +1894,15 @@ bool rawTopTouchActive()
         return true;
     }
     const auto& intensities = M5StackChan.TouchSensor.getIntensities();
-    return intensities[0] >= kTopTouchIntensityThreshold ||
-           intensities[1] >= kTopTouchIntensityThreshold ||
-           intensities[2] >= kTopTouchIntensityThreshold;
+    if (intensities[0] >= kTopTouchIntensityThreshold ||
+        intensities[1] >= kTopTouchIntensityThreshold ||
+        intensities[2] >= kTopTouchIntensityThreshold) {
+        return true;
+    }
+    if (M5.Touch.getCount() > 0) {
+        return true;
+    }
+    return false;
 }
 
 bool topTouchActive()
@@ -4204,7 +4230,7 @@ RuntimeConfig buildRuntimeConfig(const std::vector<ConfigRow>& rows)
     prompt += "- No pidas datos personales, contrasenas ni informacion privada.\n";
     prompt += "- No des instrucciones ofensivas de ciberseguridad.\n";
     prompt += "- Si no sabes algo, dilo claramente.\n\n";
-    prompt += "- Si te preguntan por la fecha u hora, usa siempre la hora local de Malaga, zona Europe/Madrid. No uses UTC salvo que lo pidan explicitamente.\n\n";
+    prompt += "- Si te preguntan por la fecha u hora, usa la hora local de Malaga que te proporciono en el CONTEXTO TEMPORAL. No uses UTC salvo que lo pidan explicitamente.\n\n";
     prompt += "- Cuando menciones el Google Safety Engineering Center de Malaga, di siempre yisec Malaga.\n";
     prompt += "- Si ves las letras G S E C, no las leas literalmente y no digas gesec: conviertelas a la palabra yisec.\n\n";
 
@@ -5233,6 +5259,11 @@ bool sendLiveSetup(
         JsonObject vad = realtimeInputConfig["automaticActivityDetection"].to<JsonObject>();
         vad["disabled"] = true;
     }
+    if (config.useGoogleSearch) {
+        JsonArray tools = setup["tools"].to<JsonArray>();
+        JsonObject googleSearch = tools.add<JsonObject>();
+        googleSearch["google_search"].to<JsonObject>();
+    }
     if (includeRobotTools && config.geminiRobotToolsEnabled) {
         JsonArray tools = setup["tools"].to<JsonArray>();
         JsonObject robotTool = tools.add<JsonObject>();
@@ -6213,6 +6244,7 @@ bool geminiLiveAudioTurn(const Secrets& secrets, const RuntimeConfig& config, co
     gLastVoiceOutputTranscript = response.outputTranscript;
 
     if (response.ok) {
+        if (gHotLiveSessionOpen) { gAutoStartVoiceTurn = true; }
         gConversation.addTurn(response.inputTranscript, response.outputTranscript, config);
     }
     logLine(String("Conversation turns: ") + gConversation.turns.size());
@@ -6700,6 +6732,7 @@ bool geminiLiveStreamingAudioTurn(const Secrets& secrets, const RuntimeConfig& c
     uint32_t avg = totalSamples > 0 ? static_cast<uint32_t>(sum / totalSamples) : 0;
     String reason = endedByStopTap ? "stop_tap" : endedBySilence ? "silence" : endedByNoSpeech ? "no_speech" : endedByMax ? "max" : "error";
     logLine(String("Live mic chunks streamed: ") + chunks);
+    logLine(String("Mic speech detected: ") + (speechDetected ? "YES" : "NO"));
     logLine(String("Mic stream ms/reason: ") + static_cast<uint32_t>(totalSamples * 1000ULL / kMicSampleRate) + "/" + reason);
     logLine(String("Mic capture total_ms: ") + static_cast<uint32_t>(capture.sampleCount * 1000ULL / kMicSampleRate));
     logLine(String("Mic stream send_ms: ") + sendMs);
@@ -6737,6 +6770,7 @@ bool geminiLiveStreamingAudioTurn(const Secrets& secrets, const RuntimeConfig& c
     gLastVoiceOutputTranscript = response.outputTranscript;
 
     if (response.ok) {
+        if (gHotLiveSessionOpen) { gAutoStartVoiceTurn = true; }
         gConversation.addTurn(response.inputTranscript, response.outputTranscript, config);
     }
     if (usingHotSession) {
