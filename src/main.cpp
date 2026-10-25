@@ -8,7 +8,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <algorithm>
-#include <driver/i2s.h>
+#include <driver/i2s_std.h>
 #include <esp_heap_caps.h>
 #include <esp_camera.h>
 #include <esp_system.h>
@@ -3186,7 +3186,7 @@ struct I2sRingAudioPlayer {
     SemaphoreHandle_t dataReady = nullptr;
     SemaphoreHandle_t spaceReady = nullptr;
     SemaphoreHandle_t finished = nullptr;
-    i2s_port_t port = I2S_NUM_1;
+    i2s_chan_handle_t txChan = nullptr;
     int16_t* ring = nullptr;
     size_t readIndex = 0;
     size_t writeIndex = 0;
@@ -3211,49 +3211,57 @@ struct I2sRingAudioPlayer {
         M5.Speaker.end();
         setCoreS3SpeakerAmp(true, kOutputSampleRate);
 
-        i2s_config_t config = {};
-        config.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_TX);
-        config.sample_rate = kOutputSampleRate;
-        config.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-        // CoreS3's AW88298 is configured by M5Unified for BCK mode 16*2.
-        // Send real stereo frames and duplicate the mono Gemini stream into L/R.
-        config.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
-        config.communication_format = I2S_COMM_FORMAT_STAND_I2S;
-        config.intr_alloc_flags = 0;
-        config.dma_buf_count = 12;
-        config.dma_buf_len = 512;
-        config.use_apll = false;
-        config.tx_desc_auto_clear = true;
-        config.fixed_mclk = 0;
-        config.mclk_multiple = I2S_MCLK_MULTIPLE_128;
-        config.bits_per_chan = I2S_BITS_PER_CHAN_16BIT;
-
-        esp_err_t err = i2s_driver_install(port, &config, 0, nullptr);
-        if (err == ESP_ERR_INVALID_STATE) {
-            i2s_driver_uninstall(port);
-            err = i2s_driver_install(port, &config, 0, nullptr);
+        if (txChan != nullptr) {
+            i2s_channel_disable(txChan);
+            i2s_del_channel(txChan);
+            txChan = nullptr;
         }
+
+        i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
+        chan_cfg.dma_desc_num = 12;
+        chan_cfg.dma_frame_num = 512;
+        chan_cfg.auto_clear = true;
+
+        esp_err_t err = i2s_new_channel(&chan_cfg, &txChan, nullptr);
         if (err != ESP_OK) {
-            logLine(String("FAIL i2s_driver_install: ") + err);
+            logLine(String("FAIL i2s_new_channel: ") + err);
             return false;
         }
 
-        i2s_pin_config_t pins = {};
-        pins.mck_io_num = I2S_PIN_NO_CHANGE;
-        pins.bck_io_num = GPIO_NUM_34;
-        pins.ws_io_num = GPIO_NUM_33;
-        pins.data_out_num = GPIO_NUM_13;
-        pins.data_in_num = I2S_PIN_NO_CHANGE;
+        i2s_std_config_t std_cfg = {
+            .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(kOutputSampleRate),
+            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+            .gpio_cfg = {
+                .mclk = I2S_GPIO_UNUSED,
+                .bclk = GPIO_NUM_34,
+                .ws = GPIO_NUM_33,
+                .dout = GPIO_NUM_13,
+                .din = I2S_GPIO_UNUSED,
+                .invert_flags = {
+                    .mclk_inv = false,
+                    .bclk_inv = false,
+                    .ws_inv = false,
+                },
+            },
+        };
+        std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_128;
+        std_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_16BIT;
 
-        err = i2s_set_pin(port, &pins);
+        err = i2s_channel_init_std_mode(txChan, &std_cfg);
         if (err != ESP_OK) {
-            logLine(String("FAIL i2s_set_pin: ") + err);
-            i2s_driver_uninstall(port);
+            logLine(String("FAIL i2s_channel_init_std_mode: ") + err);
+            i2s_del_channel(txChan);
+            txChan = nullptr;
             return false;
         }
 
-        i2s_zero_dma_buffer(port);
-        i2s_start(port);
+        err = i2s_channel_enable(txChan);
+        if (err != ESP_OK) {
+            logLine(String("FAIL i2s_channel_enable: ") + err);
+            i2s_del_channel(txChan);
+            txChan = nullptr;
+            return false;
+        }
         return true;
     }
 
@@ -3299,8 +3307,11 @@ struct I2sRingAudioPlayer {
         if (created != pdPASS) {
             logLine("FAIL i2s task create");
             failed = true;
-            i2s_stop(port);
-            i2s_driver_uninstall(port);
+            if (txChan != nullptr) {
+                i2s_channel_disable(txChan);
+                i2s_del_channel(txChan);
+                txChan = nullptr;
+            }
             setCoreS3SpeakerAmp(false, kOutputSampleRate);
             cleanup();
             return false;
@@ -3395,7 +3406,6 @@ struct I2sRingAudioPlayer {
         if (spaceReady != nullptr) {
             xSemaphoreGive(spaceReady);
         }
-        i2s_zero_dma_buffer(port);
     }
 
     void run()
@@ -3483,7 +3493,7 @@ struct I2sRingAudioPlayer {
             size_t byteOffset = 0;
             while (byteOffset < bytes && !interrupted) {
                 size_t written = 0;
-                esp_err_t err = i2s_write(port, data + byteOffset, bytes - byteOffset, &written, pdMS_TO_TICKS(1000));
+                esp_err_t err = i2s_channel_write(txChan, data + byteOffset, bytes - byteOffset, &written, 1000);
                 if (err != ESP_OK || written == 0) {
                     failed = true;
                     break;
@@ -3519,8 +3529,11 @@ struct I2sRingAudioPlayer {
             serviceRobot();
         }
 
-        i2s_stop(port);
-        i2s_driver_uninstall(port);
+        if (txChan != nullptr) {
+            i2s_channel_disable(txChan);
+            i2s_del_channel(txChan);
+            txChan = nullptr;
+        }
         setCoreS3SpeakerAmp(false, kOutputSampleRate);
         active = false;
         cleanup();
@@ -3550,6 +3563,11 @@ struct I2sRingAudioPlayer {
 
     void cleanup()
     {
+        if (txChan != nullptr) {
+            i2s_channel_disable(txChan);
+            i2s_del_channel(txChan);
+            txChan = nullptr;
+        }
         if (ring != nullptr) {
             heap_caps_free(ring);
             ring = nullptr;

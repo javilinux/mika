@@ -1,6 +1,7 @@
 # Local credentials and runtime cache
 config/*.local.json
 data/secrets.json
+backups/
 cache/
 generated/
 *.mp3
