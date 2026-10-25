@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <DNSServer.h>
+#include <ESPmDNS.h>
 #include <HTTPClient.h>
 #include <LittleFS.h>
 #include <M5StackChan.h>
@@ -1089,6 +1090,16 @@ public:
         moveTo(kServoYawCenter, kServoPitchCenter, speed);
     }
 
+    void moveHeadTo(int yaw, int pitch, int speed = kServoGestureSpeed, uint32_t holdMs = 2000)
+    {
+        if (!ready) {
+            return;
+        }
+        clearActiveSequence();
+        pendingReturnAt = holdMs > 0 ? (millis() + holdMs) : 0;
+        moveTo(yaw, pitch, speed);
+    }
+
     void performPresenceNotice()
     {
         if (!ready || activeSequence != nullptr || pendingReturnAt > 0) {
@@ -1823,6 +1834,8 @@ void closeHotLiveSession(const char* reason);
 void serviceHotLiveSession();
 bool runWifiSetupPortal();
 bool runWifiCameraQrScanner();
+void beginRemoteControlServer();
+void stopRemoteControlServer();
 bool parseWifiPayloadString(const String& raw, String& outSsid, String& outPassword);
 bool saveWifiCredentialToSecrets(const String& ssid, const String& password);
 bool beginStackChanCamera();
@@ -4442,6 +4455,7 @@ bool runWifiSetupPortal()
 {
     constexpr const char* kApSsid = "Mika-Setup";
     logLine("Starting WiFi Setup Portal...");
+    stopRemoteControlServer();
     setStatusColor(0, 24, 40);
 
     WiFi.mode(WIFI_AP_STA);
@@ -4574,7 +4588,11 @@ bool runWifiSetupPortal()
     WiFi.mode(WIFI_STA);
 
     if (switchToCameraQr) {
-        return runWifiCameraQrScanner();
+        bool qrOk = runWifiCameraQrScanner();
+        if (qrOk) {
+            beginRemoteControlServer();
+        }
+        return qrOk;
     }
 
     bool connected = false;
@@ -4592,6 +4610,9 @@ bool runWifiSetupPortal()
         connected = (WiFi.status() == WL_CONNECTED) || connectWifi(gSecrets.wifiNetworks);
     }
 
+    if (connected) {
+        beginRemoteControlServer();
+    }
     gVisual.resumeDrawing();
     setRobotState(connected ? VisualState::Idle : VisualState::Error);
     return connected;
@@ -7472,6 +7493,327 @@ void printHeap()
     }
 }
 
+WebServer gRemoteServer(80);
+bool gRemoteServerStarted = false;
+String gPendingRemoteSpeakText;
+String gPendingRemoteSpeakMode = "say";
+String gPendingRemoteGesture;
+
+bool triggerNamedAction(String actionName, int yawOverride = 9999, int pitchOverride = 9999)
+{
+    actionName.trim();
+    actionName.toLowerCase();
+
+    bool acted = false;
+    if (yawOverride != 9999 || pitchOverride != 9999) {
+        int yaw = (yawOverride != 9999) ? std::max(-1000, std::min(1000, yawOverride)) : kServoYawCenter;
+        int pitch = (pitchOverride != 9999) ? std::max(-200, std::min(750, pitchOverride)) : kServoPitchCenter;
+        gGestures.moveHeadTo(yaw, pitch, 240, 2500);
+        acted = true;
+    }
+
+    if (actionName == "chiquito" || actionName == "epetekan" || actionName == "fistro") {
+        gVisual.setExpressionFor(VisualExpression::Happy, 4200);
+        gGestures.performChiquitoEasterEgg();
+        requestLocalSfx((esp_random() % 2) == 0 ? LocalSfx::ChiquitoGrito : LocalSfx::ChiquitoEpetekan);
+        return true;
+    }
+    if (actionName == "dance" || actionName == "baile" || actionName == "bailar") {
+        gVisual.setExpressionFor(VisualExpression::Happy, 11500);
+        gGestures.startOfficialDance();
+        requestLocalSfx(LocalSfx::Dance);
+        return true;
+    }
+    if (actionName == "giggle" || actionName == "risa" || actionName == "happy" || actionName == "feliz") {
+        gVisual.setExpressionFor(VisualExpression::Happy, 3200);
+        gGestures.performContentGesture(ContentGesture::Nod);
+        requestLocalSfx(LocalSfx::GiggleBright);
+        return true;
+    }
+    if (actionName == "tada" || actionName == "celebrar") {
+        gVisual.setExpressionFor(VisualExpression::Happy, 3200);
+        gGestures.performContentGesture(ContentGesture::Nod);
+        requestLocalSfx(LocalSfx::Tada);
+        return true;
+    }
+    if (actionName == "surprised" || actionName == "sorpresa" || actionName == "ooh") {
+        gVisual.setExpressionFor(VisualExpression::Surprised, 3000);
+        gGestures.performMouthTouch();
+        requestLocalSfx(LocalSfx::SurpriseOoh);
+        return true;
+    }
+    if (actionName == "sad" || actionName == "triste") {
+        gVisual.setExpressionFor(VisualExpression::Sad, 3500);
+        gGestures.performContentGesture(ContentGesture::Tilt);
+        requestLocalSfx(LocalSfx::SadAww);
+        return true;
+    }
+    if (actionName == "angry" || actionName == "enfadado") {
+        gVisual.setExpressionFor(VisualExpression::Angry, 3500);
+        gGestures.performContentGesture(ContentGesture::Shake);
+        requestLocalSfx(LocalSfx::Ouch);
+        return true;
+    }
+    if (actionName == "dizzy" || actionName == "mareado") {
+        gVisual.setExpressionFor(VisualExpression::Dizzy, 3500);
+        gGestures.performDizzyReaction();
+        requestLocalSfx(LocalSfx::DizzyMareao);
+        return true;
+    }
+    if (actionName == "nod" || actionName == "asentir" || actionName == "si") {
+        gGestures.performContentGesture(ContentGesture::Nod);
+        return true;
+    }
+    if (actionName == "shake" || actionName == "negar" || actionName == "no") {
+        gGestures.performContentGesture(ContentGesture::Shake);
+        return true;
+    }
+    if (actionName == "tilt" || actionName == "ladear") {
+        gGestures.performContentGesture(ContentGesture::Tilt);
+        return true;
+    }
+    if (actionName == "center" || actionName == "centro") {
+        gGestures.forceCenter();
+        return true;
+    }
+    if (actionName == "left" || actionName == "izquierda") {
+        gGestures.moveHeadTo(550, kServoPitchCenter, 240, 2500);
+        return true;
+    }
+    if (actionName == "right" || actionName == "derecha") {
+        gGestures.moveHeadTo(-550, kServoPitchCenter, 240, 2500);
+        return true;
+    }
+    if (actionName == "up" || actionName == "arriba") {
+        gGestures.moveHeadTo(kServoYawCenter, kServoPitchCenter - 180, 240, 2500);
+        return true;
+    }
+    if (actionName == "down" || actionName == "abajo") {
+        gGestures.moveHeadTo(kServoYawCenter, kServoPitchCenter + 180, 240, 2500);
+        return true;
+    }
+    return acted;
+}
+
+bool runRemoteSpeakTurn(String text, String mode, String gesture)
+{
+    text.trim();
+    if (text.isEmpty() || gTurnRunning) {
+        return false;
+    }
+
+    logLine(String("Remote speak turn [") + mode + "]: " + text);
+    closeHotLiveSession("remote speak");
+
+    gTurnRunning = true;
+    gBargeInRequested = false;
+    gVisual.resumeDrawing();
+
+    if (!gesture.isEmpty()) {
+        triggerNamedAction(gesture);
+    }
+
+    setRobotState(VisualState::Thinking);
+    serviceRobot();
+
+    WiFiClientSecure client;
+    if (!openGeminiLiveWebSocket(gSecrets, client, true)) {
+        setRobotState(VisualState::Error);
+        gTurnRunning = false;
+        return false;
+    }
+
+    mode.trim();
+    mode.toLowerCase();
+    String instruction;
+    String userPayload;
+    if (mode == "ask" || mode == "chat" || mode == "chicui") {
+        instruction = gRuntimeConfig.systemPrompt.isEmpty()
+                          ? "Responde en espanol con mucha gracia como Mika (Chicui), un robot StackChan saleroso."
+                          : gRuntimeConfig.systemPrompt;
+        userPayload = text;
+    } else {
+        instruction =
+            "Eres Mika (Chicui), un robot StackChan saleroso y expresivo en casa de Javier. "
+            "Di en voz alta en espanol EXACTAMENTE el mensaje que te envie el usuario, con entonacion muy natural y expresiva, "
+            "sin anadir frases introductorias como 'Claro' ni explicaciones adicionales.";
+        userPayload = String("Di exactamente esto en voz alta: ") + text;
+    }
+
+    if (!sendLiveSetup(client, gRuntimeConfig, instruction, false, false, true)) {
+        client.stop();
+        setRobotState(VisualState::Error);
+        gTurnRunning = false;
+        return false;
+    }
+
+    if (!sendLiveText(client, userPayload.c_str())) {
+        client.stop();
+        setRobotState(VisualState::Error);
+        gTurnRunning = false;
+        return false;
+    }
+
+    LiveResponseResult response = collectLiveResponse(client, 45000, gRuntimeConfig);
+    client.stop();
+
+    gLastVoiceInputTranscript = String("[Telegram] ") + text;
+    gLastVoiceOutputTranscript = response.outputTranscript;
+
+    setStatusColor(response.ok ? 0 : 40, response.ok ? 32 : 0, 0);
+    setRobotState(response.ok ? VisualState::Idle : VisualState::Error);
+    gTurnRunning = false;
+    gNextTouchStartAllowedAt = millis() + kTouchRestartCooldownMs;
+    return response.ok;
+}
+
+void stopRemoteControlServer()
+{
+    if (!gRemoteServerStarted) {
+        return;
+    }
+    gRemoteServer.stop();
+    gRemoteServerStarted = false;
+}
+
+void beginRemoteControlServer()
+{
+    if (gRemoteServerStarted) {
+        return;
+    }
+
+    if (MDNS.begin("mika")) {
+        MDNS.addService("http", "tcp", 80);
+        logLine("OK mDNS: http://mika.local");
+    }
+
+    gRemoteServer.on("/api/status", HTTP_GET, []() {
+        JsonDocument doc;
+        doc["ok"] = true;
+        doc["name"] = "Mika";
+        doc["ip"] = WiFi.localIP().toString();
+        doc["ssid"] = WiFi.SSID();
+        doc["rssi"] = WiFi.RSSI();
+        doc["uptime_s"] = millis() / 1000UL;
+        doc["battery_level"] = M5.Power.getBatteryLevel();
+        doc["is_charging"] = M5.Power.isCharging();
+        doc["busy"] = gTurnRunning || gResponsePlaybackActive || gPhotoWorkflowBusy;
+        doc["heap_free"] = ESP.getFreeHeap();
+        doc["psram_free"] = psramFound() ? ESP.getFreePsram() : 0;
+        doc["last_input"] = gLastVoiceInputTranscript;
+        doc["last_output"] = gLastVoiceOutputTranscript;
+        String out;
+        serializeJson(doc, out);
+        gRemoteServer.send(200, "application/json; charset=utf-8", out);
+    });
+
+    auto handleSpeak = []() {
+        String text = gRemoteServer.arg("text");
+        String mode = gRemoteServer.arg("mode");
+        String gesture = gRemoteServer.arg("gesture");
+
+        if (text.isEmpty() && gRemoteServer.hasArg("plain")) {
+            JsonDocument bodyDoc;
+            if (!deserializeJson(bodyDoc, gRemoteServer.arg("plain"))) {
+                text = bodyDoc["text"] | "";
+                if (mode.isEmpty()) {
+                    mode = bodyDoc["mode"] | "say";
+                }
+                if (gesture.isEmpty()) {
+                    gesture = bodyDoc["gesture"] | "";
+                }
+            }
+        }
+        text.trim();
+        if (mode.isEmpty()) {
+            mode = "say";
+        }
+
+        if (text.isEmpty()) {
+            gRemoteServer.send(400, "application/json", "{\"ok\":false,\"error\":\"missing text\"}");
+            return;
+        }
+        if (gTurnRunning) {
+            gRemoteServer.send(409, "application/json", "{\"ok\":false,\"error\":\"robot busy\"}");
+            return;
+        }
+
+        gPendingRemoteSpeakText = text;
+        gPendingRemoteSpeakMode = mode;
+        gPendingRemoteGesture = gesture;
+
+        JsonDocument resp;
+        resp["ok"] = true;
+        resp["queued"] = true;
+        resp["text"] = text;
+        resp["mode"] = mode;
+        resp["gesture"] = gesture;
+        String out;
+        serializeJson(resp, out);
+        gRemoteServer.send(200, "application/json; charset=utf-8", out);
+    };
+
+    gRemoteServer.on("/api/speak", HTTP_GET, handleSpeak);
+    gRemoteServer.on("/api/speak", HTTP_POST, handleSpeak);
+
+    auto handleAction = []() {
+        String type = gRemoteServer.arg("type");
+        int yaw = gRemoteServer.hasArg("yaw") ? gRemoteServer.arg("yaw").toInt() : 9999;
+        int pitch = gRemoteServer.hasArg("pitch") ? gRemoteServer.arg("pitch").toInt() : 9999;
+
+        if (type.isEmpty() && yaw == 9999 && pitch == 9999 && gRemoteServer.hasArg("plain")) {
+            JsonDocument bodyDoc;
+            if (!deserializeJson(bodyDoc, gRemoteServer.arg("plain"))) {
+                type = bodyDoc["type"] | (bodyDoc["action"] | "");
+                if (!bodyDoc["yaw"].isNull()) {
+                    yaw = bodyDoc["yaw"].as<int>();
+                }
+                if (!bodyDoc["pitch"].isNull()) {
+                    pitch = bodyDoc["pitch"].as<int>();
+                }
+            }
+        }
+
+        bool ok = triggerNamedAction(type, yaw, pitch);
+        JsonDocument resp;
+        resp["ok"] = ok;
+        resp["action"] = type;
+        if (yaw != 9999) {
+            resp["yaw"] = yaw;
+        }
+        if (pitch != 9999) {
+            resp["pitch"] = pitch;
+        }
+        String out;
+        serializeJson(resp, out);
+        gRemoteServer.send(ok ? 200 : 400, "application/json; charset=utf-8", out);
+    };
+
+    gRemoteServer.on("/api/action", HTTP_GET, handleAction);
+    gRemoteServer.on("/api/action", HTTP_POST, handleAction);
+
+    gRemoteServer.begin();
+    gRemoteServerStarted = true;
+    logLine(String("OK Remote HTTP API on http://") + WiFi.localIP().toString() + "/api/status");
+}
+
+void serviceRemoteControlServer()
+{
+    if (!gRemoteServerStarted || WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+    gRemoteServer.handleClient();
+    if (!gPendingRemoteSpeakText.isEmpty() && gReadyForVoice && !gTurnRunning) {
+        String text = gPendingRemoteSpeakText;
+        String mode = gPendingRemoteSpeakMode;
+        String gesture = gPendingRemoteGesture;
+        gPendingRemoteSpeakText = "";
+        gPendingRemoteSpeakMode = "say";
+        gPendingRemoteGesture = "";
+        runRemoteSpeakTurn(text, mode, gesture);
+    }
+}
+
 }  // namespace
 
 void setup()
@@ -7536,6 +7878,7 @@ void setup()
         return;
     }
 
+    beginRemoteControlServer();
     gReadyForVoice = true;
     setRobotState(VisualState::Idle);
     gImuReactions.recalibrate(2500);
@@ -7551,6 +7894,7 @@ void loop()
 {
     serviceRobot();
     serviceHotLiveSession();
+    serviceRemoteControlServer();
     uint32_t now = millis();
     handleScreenCheekTouch(now);
 
