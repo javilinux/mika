@@ -388,6 +388,48 @@ Motivo: produjo bucles de interrupcion y reinicio de frase. Para cortar una resp
 - `tools/generate_sfx_live.py`: genera SFX no linguisticos con Live API.
 - `tools/generate_tts_sfx.py`: genera frases expresivas con Gemini TTS/Puck y anade silencio final para evitar cortes.
 
+## Arquitectura de Alimentacion y Pantalla (CoreS3 + StackChan K151)
+
+### 1. Puertos USB-C y Alimentacion
+- **Puerto Lateral (CoreS3):** Conecta directamente con el ESP32-S3 (USB-Serial/JTAG nativo). Alimenta la CPU, Wi-Fi, pantalla y sensores con los 5V del bus USB. Es el puerto obligatorio para desarrollo, logs por consola y flasheo.
+- **Puerto de la Base (StackChan K151):** Alimenta el circuito de carga de la bateria LiPo interna de la base.
+  - *Sintoma de bateria agotada:* Luz roja fija (cargando) y boton de encendido verde que solo se ilumina mientras se pulsa (al soltarlo se apaga). Ocurre porque la bateria esta por debajo del umbral de corte y el circuito de autoenclavamiento no puede sostenerse. Requiere dejar cargando la base con cargador USB antes de usarlo sin cable.
+
+### 2. Discrepancia de Autodeteccion M5GFX vs M5Unified (Pantalla Negra)
+- Al acoplar el CoreS3 a la base StackChan, `M5GFX` detecta el expansor de la base en `0x6F` y asigna `board_t::board_M5StackChan` (ID `27`).
+- Sin embargo, `M5Unified` (version 0.2.14) no tiene mapeado el ID `27` en su tabla interna de pines para `CONFIG_IDF_TARGET_ESP32S3`. Como resultado, cae en `board_unknown` y asigna el bus I2C interno a los pines de AtomS3 (`SCL=39, SDA=38`) en vez de los pines reales del CoreS3 (`SCL=11, SDA=12`).
+- Esto provocaba que:
+  1. `M5.In_I2C` no pudiera comunicarse con el PMIC AXP2101 ni con el expansor AW9523B.
+  2. El convertidor **SY7088 Boost Converter** (necesario para el voltaje de la retroiluminacion) nunca se activase.
+  3. El rail **DLDO1** del AXP2101 (control de brillo LCD) permaneciese apagado a 0V, dejando la pantalla completamente en negro.
+  4. La IMU BMI270/BMM150 fallara al iniciar (`WARN IMU unavailable`).
+
+### 3. Solucion Permanente en Firmware (`setup()`)
+En `src/main.cpp` tras `M5StackChan.begin()` se ejecuta de forma determinista:
+```cpp
+// 1. Forzar bus I2C interno a los pines reales del CoreS3
+M5.In_I2C.release();
+M5.In_I2C.begin(I2C_NUM_1, GPIO_NUM_12, GPIO_NUM_11);
+
+// 2. Activar SY7088 Boost Converter y liberar LCD_RST en AW9523 (0x58)
+M5.In_I2C.bitOn(0x58, 0x03, 0b10000010, 400000);
+M5.In_I2C.writeRegister8(0x58, 0x04, 0b00011000, 400000);
+M5.In_I2C.writeRegister8(0x58, 0x05, 0b00001100, 400000);
+M5.In_I2C.writeRegister8(0x58, 0x11, 0b00010000, 400000);
+
+// 3. Activar railes LDO y voltaje de retroiluminacion DLDO1 (3.2V) en AXP2101 (0x34)
+M5.In_I2C.bitOn(0x34, 0x90, 0xBF, 400000);
+M5.In_I2C.writeRegister8(0x34, 0x92, 18 - 5, 400000); // ALDO1 1.8V
+M5.In_I2C.writeRegister8(0x34, 0x93, 33 - 5, 400000); // ALDO2 3.3V
+M5.In_I2C.writeRegister8(0x34, 0x94, 33 - 5, 400000); // ALDO3 3.3V
+M5.In_I2C.writeRegister8(0x34, 0x95, 33 - 5, 400000); // ALDO4 3.3V
+M5.In_I2C.writeRegister8(0x34, 0x99, 27, 400000);     // DLDO1 3.2V
+
+// 4. Fijar brillo de pantalla
+M5StackChan.Display().setBrightness(220);
+M5.Display.setBrightness(220);
+```
+
 ## Checklist de demo
 
 1. `python3 tools/prepare_device_fs.py`

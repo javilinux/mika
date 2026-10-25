@@ -383,6 +383,7 @@ public:
         }
 
         auto& display = M5StackChan.Display();
+        display.setBrightness(180);
         canvas = new M5Canvas(&display);
         if (canvas == nullptr) {
             Serial.println("WARN visual canvas alloc");
@@ -7700,9 +7701,26 @@ void beginRemoteControlServer()
         doc["ssid"] = WiFi.SSID();
         doc["rssi"] = WiFi.RSSI();
         doc["uptime_s"] = millis() / 1000UL;
-        doc["battery_level"] = M5.Power.getBatteryLevel();
+        float batVoltage = M5StackChan.getBatteryVoltage();
+        float batCurrent = M5StackChan.getBatteryCurrent() * 1000.0f;
+        doc["battery_voltage"] = batVoltage;
+        doc["battery_current_ma"] = batCurrent;
+        int level = M5.Power.getBatteryLevel();
+        if (batVoltage >= 3.0f) {
+            level = constrain(static_cast<int>((batVoltage - 3.2f) / (4.15f - 3.2f) * 100.0f), 0, 100);
+        }
+        doc["battery_level"] = level;
         doc["is_charging"] = M5.Power.isCharging();
         doc["busy"] = gTurnRunning || gResponsePlaybackActive || gPhotoWorkflowBusy;
+        doc["board"] = static_cast<int>(M5.getBoard());
+        doc["display_board"] = static_cast<int>(M5.Display.getBoard());
+        doc["display_width"] = M5.Display.width();
+        doc["display_height"] = M5.Display.height();
+        doc["display_brightness"] = M5.Display.getBrightness();
+        doc["visual_ready"] = gVisual.isReady();
+        doc["axp_reg90"] = M5.In_I2C.readRegister8(0x34, 0x90, 400000);
+        doc["axp_reg99"] = M5.In_I2C.readRegister8(0x34, 0x99, 400000);
+        doc["aw_reg03"] = M5.In_I2C.readRegister8(0x58, 0x03, 400000);
         doc["heap_free"] = ESP.getFreeHeap();
         doc["psram_free"] = psramFound() ? ESP.getFreePsram() : 0;
         doc["last_input"] = gLastVoiceInputTranscript;
@@ -7879,6 +7897,27 @@ void beginRemoteControlServer()
     gRemoteServer.on("/api/camera", HTTP_GET, handleCamera);
     gRemoteServer.on("/api/camera", HTTP_POST, handleCamera);
 
+    gRemoteServer.on("/api/display", HTTP_ANY, []() {
+        int b = gRemoteServer.hasArg("b") ? gRemoteServer.arg("b").toInt() : 220;
+        String color = gRemoteServer.arg("color");
+        M5.In_I2C.begin(I2C_NUM_1, GPIO_NUM_12, GPIO_NUM_11);
+        M5.In_I2C.bitOn(0x58, 0x03, 0b10000010, 400000);
+        M5.In_I2C.bitOn(0x34, 0x90, 0xBF, 400000);
+        M5.In_I2C.writeRegister8(0x34, 0x99, 27, 400000);
+        M5StackChan.Display().setBrightness(b);
+        if (color == "red") M5StackChan.Display().fillScreen(TFT_RED);
+        else if (color == "white") M5StackChan.Display().fillScreen(TFT_WHITE);
+        else if (color == "blue") M5StackChan.Display().fillScreen(TFT_BLUE);
+        else if (color == "green") M5StackChan.Display().fillScreen(TFT_GREEN);
+        JsonDocument doc;
+        doc["ok"] = true;
+        doc["brightness"] = b;
+        doc["color"] = color;
+        String out;
+        serializeJson(doc, out);
+        gRemoteServer.send(200, "application/json", out);
+    });
+
     gRemoteServer.begin();
     gRemoteServerStarted = true;
     logLine(String("OK Remote HTTP API on http://") + WiFi.localIP().toString() + "/api/status");
@@ -7909,6 +7948,29 @@ void setup()
     delay(500);
 
     M5StackChan.begin();
+
+    // Fix: M5Unified maps board 27 (M5StackChan) to unknown pins (39, 38). Force internal I2C to CoreS3 pins (SDA=12, SCL=11)
+    M5.In_I2C.release();
+    M5.In_I2C.begin(I2C_NUM_1, GPIO_NUM_12, GPIO_NUM_11);
+
+    // Explicitly power CoreS3 display rails (AW9523 + AXP2101)
+    M5.In_I2C.bitOn(0x58, 0x03, 0b10000010, 400000); // SY7088 BOOST_EN + release LCD_RST
+    M5.In_I2C.writeRegister8(0x58, 0x04, 0b00011000, 400000);
+    M5.In_I2C.writeRegister8(0x58, 0x05, 0b00001100, 400000);
+    M5.In_I2C.writeRegister8(0x58, 0x11, 0b00010000, 400000);
+
+    M5.In_I2C.bitOn(0x34, 0x90, 0xBF, 400000); // Enable all LDOS (DLDO1 backlight, ALDO1-4)
+    M5.In_I2C.writeRegister8(0x34, 0x92, 18 - 5, 400000); // ALDO1 1.8V
+    M5.In_I2C.writeRegister8(0x34, 0x93, 33 - 5, 400000); // ALDO2 3.3V
+    M5.In_I2C.writeRegister8(0x34, 0x94, 33 - 5, 400000); // ALDO3 3.3V
+    M5.In_I2C.writeRegister8(0x34, 0x95, 33 - 5, 400000); // ALDO4 3.3V
+    M5.In_I2C.writeRegister8(0x34, 0x99, 27, 400000);     // DLDO1 3.2V
+
+    M5StackChan.Display().setBrightness(220);
+    M5.Display.setBrightness(220);
+    M5StackChan.Display().fillScreen(0x0215); // Deep cyan splash indicator
+    delay(80);
+
     gGestures.begin();
     gVisual.begin();
     if (gImuReactions.begin()) {
