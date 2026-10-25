@@ -100,7 +100,7 @@ make fs
   2. Pon la pantalla del móvil frente a la cámara de Mika (dentro del recuadro verde en pantalla).
   3. Al detectarlo (soporta imagen normal y espejada automáticamente con `quirc_flip`), Mika guarda la red en `/secrets.json`, se conecta y reproduce el sonido de confirmación (`Tada`).
 
-## 5. Control Remoto por HTTP y Bot de Telegram `@Martiricos_bot` (Paso 3.1)
+## 5. Control Remoto por HTTP y Bot de Telegram `@Martiricos_bot` (Pasos 3.1 y 3.2)
 Mika expone un servidor HTTP ligero (0% de impacto en batería en reposo) en el puerto `80` (`http://192.168.1.36` y `http://mika.local` vía mDNS):
 
 ### Endpoints HTTP en Mika (`src/main.cpp`)
@@ -110,6 +110,9 @@ Mika expone un servidor HTTP ligero (0% de impacto en batería en reposo) en el 
   - `mode="ask"`: Mika responde o improvisa sobre el mensaje con su personalidad completa de **Chicui**.
 - `POST /api/action` (o `GET /api/action?type=...&yaw=...&pitch=...`):
   - Dispara gestos, expresiones y efectos locales: `chiquito`, `dance`, `giggle`, `happy`, `sad`, `angry`, `surprised`, `dizzy`, `tada`, `nod`, `shake`, `tilt`, `center`, `left`, `right`, `up`, `down`.
+- `GET /api/camera` (opcional `?dir=left|right|up|down|center` o `?yaw=...&pitch=...`):
+  - Si se indica orientación, gira antes los servos y espera a estabilizar el encuadre.
+  - Enciende la cámara frontal `GC0308` durante ~1 segundo, descarta los primeros frames para ajustar exposición, muestra la previsualización en la pantalla de Mika, codifica el fotograma a `image/jpeg` y vuelve a apagar la cámara (`esp_camera_deinit`) para no consumir batería en reposo.
 
 ### Uso desde CLI (`tools/mika_client.py`)
 ```bash
@@ -118,16 +121,20 @@ python3 tools/mika_client.py say "Hola familia, a cenar"
 python3 tools/mika_client.py ask "Cuéntame un chiste corto"
 python3 tools/mika_client.py action chiquito
 python3 tools/mika_client.py action dance
+python3 tools/mika_client.py camera "" /tmp/mika.jpg
+python3 tools/mika_client.py camera left /tmp/mika_left.jpg
 ```
 
 ### Uso desde Telegram (`@Martiricos_bot`)
 - **En lenguaje natural o nota de voz**:
   - *"Dile por Mika a los niños que bajen a cenar"*
   - *"Haz que Mika haga el Chiquito"* / *"Que Mika baile"*
+  - *"¿Qué ve Mika?"* / *"Saca una foto con Mika mirando a la izquierda"*
   - *"Cómo está Mika de batería"*
 - **Con comandos directos**:
   - `/decir Hola familia`
   - `/mika pregunta Cuéntame un chiste`
+  - `/mika foto` | `/mika foto izquierda` | `/mika foto derecha` | `/foto_mika`
   - `/chiquito` o `/mika chiquito`
   - `/bailar` o `/mika baile`
   - `/mika estado`

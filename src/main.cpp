@@ -5081,38 +5081,42 @@ bool beginStackChanCamera()
         return true;
     }
 
+    M5.In_I2C.release();
+
     camera_config_t config = {};
-    config.ledc_channel = LEDC_CHANNEL_0;
-    config.ledc_timer = LEDC_TIMER_0;
-    config.pin_d0 = 39;
-    config.pin_d1 = 40;
-    config.pin_d2 = 41;
-    config.pin_d3 = 42;
-    config.pin_d4 = 15;
-    config.pin_d5 = 16;
-    config.pin_d6 = 48;
-    config.pin_d7 = 47;
-    config.pin_xclk = 2;
-    config.pin_pclk = 45;
-    config.pin_vsync = 46;
-    config.pin_href = 38;
-    config.pin_sccb_sda = -1;
-    config.pin_sccb_scl = -1;
-    config.sccb_i2c_port = M5.In_I2C.getPort();
     config.pin_pwdn = -1;
     config.pin_reset = -1;
+    config.pin_xclk = -1;
+    config.pin_sccb_sda = 12;
+    config.pin_sccb_scl = 11;
+    config.pin_d7 = 47;
+    config.pin_d6 = 48;
+    config.pin_d5 = 16;
+    config.pin_d4 = 15;
+    config.pin_d3 = 42;
+    config.pin_d2 = 41;
+    config.pin_d1 = 40;
+    config.pin_d0 = 39;
+    config.pin_vsync = 46;
+    config.pin_href = 38;
+    config.pin_pclk = 45;
+
     config.xclk_freq_hz = 20000000;
-    config.frame_size = FRAMESIZE_QVGA;
+    config.ledc_timer = LEDC_TIMER_0;
+    config.ledc_channel = LEDC_CHANNEL_0;
+
     config.pixel_format = PIXFORMAT_RGB565;
-    config.grab_mode = CAMERA_GRAB_LATEST;
+    config.frame_size = FRAMESIZE_QVGA;
+    config.jpeg_quality = 0;
+    config.fb_count = 2;
     config.fb_location = CAMERA_FB_IN_PSRAM;
-    config.jpeg_quality = 10;
-    config.fb_count = 1;
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+    config.sccb_i2c_port = -1;
 
     esp_err_t err = esp_camera_init(&config);
     if (err != ESP_OK) {
-        logLine(String("Camera SCCB reused I2C port ") + static_cast<int>(config.sccb_i2c_port));
         logLine(String("FAIL camera init: 0x") + String(static_cast<uint32_t>(err), HEX));
+        M5.In_I2C.begin();
         return false;
     }
 
@@ -5138,6 +5142,7 @@ void endStackChanCamera()
     }
     esp_camera_deinit();
     gCameraInitialized = false;
+    M5.In_I2C.begin();
     logLine("OK camera deinit");
 }
 
@@ -7791,6 +7796,88 @@ void beginRemoteControlServer()
 
     gRemoteServer.on("/api/action", HTTP_GET, handleAction);
     gRemoteServer.on("/api/action", HTTP_POST, handleAction);
+
+    auto handleCamera = []() {
+        if (gTurnRunning || gPhotoWorkflowBusy) {
+            gRemoteServer.send(409, "application/json", "{\"ok\":false,\"error\":\"robot busy\"}");
+            return;
+        }
+
+        String dir = gRemoteServer.arg("dir");
+        int yaw = gRemoteServer.hasArg("yaw") ? gRemoteServer.arg("yaw").toInt() : 9999;
+        int pitch = gRemoteServer.hasArg("pitch") ? gRemoteServer.arg("pitch").toInt() : 9999;
+
+        if (dir.isEmpty() && yaw == 9999 && pitch == 9999 && gRemoteServer.hasArg("plain")) {
+            JsonDocument bodyDoc;
+            if (!deserializeJson(bodyDoc, gRemoteServer.arg("plain"))) {
+                dir = bodyDoc["dir"] | (bodyDoc["direction"] | "");
+                if (!bodyDoc["yaw"].isNull()) {
+                    yaw = bodyDoc["yaw"].as<int>();
+                }
+                if (!bodyDoc["pitch"].isNull()) {
+                    pitch = bodyDoc["pitch"].as<int>();
+                }
+            }
+        }
+
+        dir.trim();
+        dir.toLowerCase();
+        if (!dir.isEmpty() || yaw != 9999 || pitch != 9999) {
+            triggerNamedAction(dir, yaw, pitch);
+            uint32_t settleStart = millis();
+            while (millis() - settleStart < 450) {
+                serviceRobot();
+                delay(15);
+            }
+        }
+
+        if (!beginStackChanCamera()) {
+            gRemoteServer.send(500, "application/json", "{\"ok\":false,\"error\":\"camera init failed\"}");
+            return;
+        }
+
+        camera_fb_t* fb = nullptr;
+        for (int i = 0; i < 3; ++i) {
+            fb = esp_camera_fb_get();
+            if (fb != nullptr) {
+                break;
+            }
+            delay(80);
+        }
+
+        if (fb == nullptr) {
+            endStackChanCamera();
+            gRemoteServer.send(500, "application/json", "{\"ok\":false,\"error\":\"no camera frame\"}");
+            return;
+        }
+
+        if (fb->format == PIXFORMAT_RGB565 && fb->width == 320 && fb->height == 240) {
+            gVisual.suspendDrawingFor(1500);
+            M5StackChan.Display().pushImage(0, 0, 320, 240, reinterpret_cast<uint16_t*>(fb->buf));
+        }
+
+        uint8_t* jpg = nullptr;
+        size_t jpgLen = 0;
+        bool converted = frame2jpg(fb, 75, &jpg, &jpgLen);
+        esp_camera_fb_return(fb);
+        endStackChanCamera();
+
+        if (!converted || jpg == nullptr || jpgLen == 0) {
+            if (jpg != nullptr) {
+                free(jpg);
+            }
+            gRemoteServer.send(500, "application/json", "{\"ok\":false,\"error\":\"jpeg encode failed\"}");
+            return;
+        }
+
+        logLine(String("OK Remote camera JPEG bytes: ") + jpgLen);
+        gRemoteServer.sendHeader("Cache-Control", "no-store");
+        gRemoteServer.send_P(200, "image/jpeg", reinterpret_cast<const char*>(jpg), jpgLen);
+        free(jpg);
+    };
+
+    gRemoteServer.on("/api/camera", HTTP_GET, handleCamera);
+    gRemoteServer.on("/api/camera", HTTP_POST, handleCamera);
 
     gRemoteServer.begin();
     gRemoteServerStarted = true;

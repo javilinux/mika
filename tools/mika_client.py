@@ -5,13 +5,17 @@ Soporta:
   - status: estado en vivo (IP, Wi-Fi, RSSI, batería, memoria, última frase)
   - speak: hablar con voz de Gemini Live (Puck) + sincronización labial + gesto opcional
   - action: ejecutar gestos de servos, expresiones faciales y efectos locales (chiquito, dance, giggle, etc.)
+  - camera: capturar foto JPEG desde la cámara frontal GC0308 (opcionalmente orientando antes los servos)
 """
 
 import os
 import sys
 import json
+import time
 import urllib.request
 import urllib.error
+import urllib.parse
+from pathlib import Path
 from typing import Dict, Any, Optional
 
 DEFAULT_HOSTS = [
@@ -95,6 +99,40 @@ def mika_action(action_type: str = "", yaw: Optional[int] = None, pitch: Optiona
     return {"ok": False, "error": last_err}
 
 
+def capture_mika_snapshot(
+    out_path: Optional[str] = None,
+    direction: str = "",
+    yaw: Optional[int] = None,
+    pitch: Optional[int] = None,
+    timeout: float = 8.0,
+) -> Dict[str, Any]:
+    if not out_path:
+        out_path = f"/tmp/mika_snapshot_{int(time.time())}.jpg"
+    params = {}
+    if direction:
+        params["dir"] = direction.strip().lower()
+    if yaw is not None:
+        params["yaw"] = str(int(yaw))
+    if pitch is not None:
+        params["pitch"] = str(int(pitch))
+    query = ("?" + urllib.parse.urlencode(params)) if params else ""
+
+    last_err = "No se pudo conectar con la cámara de Mika"
+    for base_url in _candidate_urls("/api/camera"):
+        url = base_url + query
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = resp.read()
+                if data and len(data) > 200:
+                    Path(out_path).write_bytes(data)
+                    return {"ok": True, "path": out_path, "bytes": len(data), "direction": direction or "center"}
+                last_err = "Imagen vacía"
+        except Exception as e:
+            last_err = str(e)
+    return {"ok": False, "error": last_err}
+
+
 def format_mika_status_html(st: Dict[str, Any]) -> str:
     if not st.get("ok"):
         return f"⚠️ <b>Mika no responde en la red local</b>\n<code>{st.get('error', 'Desconectado')}</code>"
@@ -123,6 +161,10 @@ if __name__ == "__main__":
     elif cmd == "ask":
         txt = " ".join(sys.argv[2:]) or "Cuéntame un chiste corto"
         print(json.dumps(mika_speak(txt, mode="ask"), indent=2, ensure_ascii=False))
+    elif cmd in ("camera", "photo", "foto", "snap"):
+        direction = sys.argv[2] if len(sys.argv) > 2 else ""
+        out = sys.argv[3] if len(sys.argv) > 3 else "/tmp/mika_snapshot.jpg"
+        print(json.dumps(capture_mika_snapshot(out_path=out, direction=direction), indent=2, ensure_ascii=False))
     elif cmd == "action":
         act = sys.argv[2] if len(sys.argv) > 2 else "chiquito"
         print(json.dumps(mika_action(act), indent=2, ensure_ascii=False))
