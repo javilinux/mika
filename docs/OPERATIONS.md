@@ -4,6 +4,10 @@
 El entorno ya está preparado en el Mac:
 - **Directorio:** `/Users/jramirez/mika`
 - **Entorno Virtual:** `.venv/` (contiene `platformio`, `esptool`, `pyserial`, `mpremote`).
+- **M5Burner:**
+  - Aplicación gráfica instalada en `/Applications/M5Burner.app` (con permisos de Gatekeeper liberados).
+  - Herramienta CLI en `tools/m5burner_cli.py` para listar y descargar firmwares de M5Burner desde terminal sin abrir la interfaz gráfica.
+  - Firmware oficial de fábrica (`StackChan-UserDemo_V1.5.1.bin`) descargado en `backups/firmwares/`.
 - **Herramientas de Audio:** `ffmpeg` y `sox` instalados globalmente (`/opt/homebrew/bin/`).
 - **Dispositivo USB:** `/dev/cu.usbmodem1201` (CoreS3 con ESP32-S3, 16 MB Flash, 8 MB PSRAM).
 
@@ -34,6 +38,15 @@ make backup-full
 
 # Restaurar la imagen completa de 16 MB
 make restore-full
+
+# Listar todos los firmwares de M5Burner para StackChan / CoreS3
+make m5burner-list
+
+# Descargar un firmware de M5Burner por nombre
+python3 tools/m5burner_cli.py download "ESP-Claw For CoreS3"
+
+# Flashear el firmware oficial de fábrica de StackChan (V1.5.1)
+make flash-factory
 ```
 
 ## 3. Conversión de audios nuevos al formato del robot

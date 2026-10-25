@@ -46,3 +46,10 @@ backup-full:
 
 restore-full:
 	$(ESPTOOL) --chip esp32s3 --port $(PORT) --baud 921600 write-flash 0x0 backups/mika_full_16MB.bin
+
+m5burner-list:
+	$(PYTHON) tools/m5burner_cli.py list
+
+flash-factory:
+	$(ESPTOOL) --chip esp32s3 --port $(PORT) --baud 921600 write-flash 0x0 backups/firmwares/StackChan-UserDemo_V1.5.1.bin
+
