@@ -88,6 +88,18 @@ make fs
   3. Toca una de las redes detectadas, escribe la contraseña y pulsa **Guardar y Conectar**.
   4. La nueva red queda guardada con máxima prioridad en `/secrets.json` dentro de `LittleFS`.
 
+### Cambiar la Wi-Fi enseñándole un QR a la cámara del robot (Paso 2.2: Cámara QR)
+- **Cómo activarlo:**
+  - **En cualquier momento (en reposo):** Haz **doble toque en la esquina superior derecha** de la pantalla de Mika.
+  - **Desde el Portal de Configuración Wi-Fi:** Pulsa el botón azul **`LEER QR CAMARA`** en la pantalla del portal.
+- **Formatos soportados (`parseWifiPayloadString` + librería `lib/quirc`):**
+  - El código QR estándar de **"Compartir Wi-Fi"** de iOS y Android (`WIFI:S:<SSID>;T:<WPA|WEP|nopass>;P:<PASSWORD>;;`).
+  - JSON (`{"ssid":"...","password":"..."}`) o texto directo `ssid:password`.
+- **Proceso:**
+  1. En tu móvil, abre los ajustes de tu red Wi-Fi y pulsa **Compartir / Mostrar código QR**.
+  2. Pon la pantalla del móvil frente a la cámara de Mika (dentro del recuadro verde en pantalla).
+  3. Al detectarlo (soporta imagen normal y espejada automáticamente con `quirc_flip`), Mika guarda la red en `/secrets.json`, se conecta y reproduce el sonido de confirmación (`Tada`).
+
 ## 5. Notas sobre compatibilidad y drivers (ESP-IDF v5 / Arduino 3.x)
 - **M5Unified:** Fijada en `platformio.ini` a `0.2.14` para evitar roturas de API en `PY32IOExpander`.
 - **Driver I2S:** En ESP-IDF v5, `I2sRingAudioPlayer` en `src/main.cpp` utiliza la API estándar `driver/i2s_std.h` (`i2s_new_channel`, `i2s_channel_init_std_mode`, `i2s_channel_write`). No mezclar con `driver/i2s.h` legacy.

@@ -16,6 +16,7 @@
 #include <esp_system.h>
 #include <img_converters.h>
 #include <mbedtls/base64.h>
+#include <quirc.h>
 #include <ctype.h>
 #include <math.h>
 #include <string.h>
@@ -1821,7 +1822,11 @@ bool reloadRuntimeConfigFromRemote();
 void closeHotLiveSession(const char* reason);
 void serviceHotLiveSession();
 bool runWifiSetupPortal();
+bool runWifiCameraQrScanner();
+bool parseWifiPayloadString(const String& raw, String& outSsid, String& outPassword);
 bool saveWifiCredentialToSecrets(const String& ssid, const String& password);
+bool beginStackChanCamera();
+void endStackChanCamera();
 bool handleScreenMouthTouch(uint32_t now);
 bool maybeTriggerPalomaEasterEgg(String text);
 bool maybeTriggerComplimentEasterEgg(String text);
@@ -1945,6 +1950,12 @@ bool handleScreenCheekTouch(uint32_t now)
             gNextScreenCheekTouchAllowedAt = now + 1500;
             logLine("Screen WiFi setup portal requested");
             runWifiSetupPortal();
+            return true;
+        }
+        if (topZone && touch.x > (width * 2) / 3) {
+            gNextScreenCheekTouchAllowedAt = now + 1500;
+            logLine("Screen WiFi camera QR scanner requested");
+            runWifiCameraQrScanner();
             return true;
         }
         if (topZone) {
@@ -4122,6 +4133,258 @@ bool saveWifiCredentialToSecrets(const String& ssid, const String& password)
     return loadSecrets(gSecrets);
 }
 
+bool parseWifiPayloadString(const String& raw, String& outSsid, String& outPassword)
+{
+    String trimmed = raw;
+    trimmed.trim();
+    if (trimmed.isEmpty()) {
+        return false;
+    }
+
+    // 1. Standard WIFI:S:<ssid>;T:<WPA|WEP|nopass>;P:<password>;H:<true|false>;;
+    if (trimmed.startsWith("WIFI:") || trimmed.startsWith("wifi:")) {
+        String body = trimmed.substring(5);
+        String ssid;
+        String password;
+
+        size_t i = 0;
+        while (i < body.length()) {
+            // Find key:value;
+            int colon = body.indexOf(':', i);
+            if (colon < 0) {
+                break;
+            }
+            String key = body.substring(i, colon);
+            key.trim();
+            key.toUpperCase();
+
+            String val;
+            size_t j = static_cast<size_t>(colon + 1);
+            while (j < body.length()) {
+                char c = body[j];
+                if (c == '\\' && j + 1 < body.length()) {
+                    val += body[j + 1];
+                    j += 2;
+                    continue;
+                }
+                if (c == ';') {
+                    ++j;
+                    break;
+                }
+                val += c;
+                ++j;
+            }
+            if (key == "S") {
+                ssid = val;
+            } else if (key == "P") {
+                password = val;
+            }
+            i = j;
+            while (i < body.length() && body[i] == ';') {
+                ++i;
+            }
+        }
+
+        if (!ssid.isEmpty()) {
+            outSsid = ssid;
+            outPassword = password;
+            return true;
+        }
+    }
+
+    // 2. JSON {"ssid":"...","password":"..."}
+    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+        JsonDocument doc;
+        if (!deserializeJson(doc, trimmed)) {
+            String s = doc["ssid"] | "";
+            String p = doc["password"] | "";
+            s.trim();
+            if (!s.isEmpty()) {
+                outSsid = s;
+                outPassword = p;
+                return true;
+            }
+        }
+    }
+
+    // 3. Simple "ssid:password" (when not a URL)
+    if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
+        int colon = trimmed.indexOf(':');
+        if (colon > 0) {
+            String s = trimmed.substring(0, colon);
+            String p = trimmed.substring(colon + 1);
+            s.trim();
+            if (!s.isEmpty() && s.indexOf(' ') < 0) {
+                outSsid = s;
+                outPassword = p;
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+bool runWifiCameraQrScanner()
+{
+    logLine("Starting WiFi Camera QR Scanner...");
+    gVisual.suspendDrawingFor(600000);
+    setStatusColor(0, 32, 32);
+
+    auto& display = M5StackChan.Display();
+    display.fillScreen(rgb565(12, 18, 28));
+    display.setTextSize(1);
+    display.setTextColor(rgb565(80, 220, 255), rgb565(12, 18, 28));
+    display.setCursor(20, 100);
+    display.print("Iniciando camara para leer QR Wi-Fi...");
+
+    if (!beginStackChanCamera()) {
+        display.fillScreen(rgb565(32, 12, 12));
+        display.setTextColor(TFT_WHITE, rgb565(32, 12, 12));
+        display.setCursor(20, 110);
+        display.print("Error: Camara GC0308 no disponible.");
+        delay(2000);
+        gVisual.resumeDrawing();
+        return false;
+    }
+
+    struct quirc* q = quirc_new();
+    if (q == nullptr || quirc_resize(q, 320, 240) < 0) {
+        logLine("FAIL quirc alloc");
+        if (q != nullptr) {
+            quirc_destroy(q);
+        }
+        endStackChanCamera();
+        gVisual.resumeDrawing();
+        return false;
+    }
+
+    auto* qrCode = static_cast<struct quirc_code*>(calloc(1, sizeof(struct quirc_code)));
+    auto* qrData = static_cast<struct quirc_data*>(calloc(1, sizeof(struct quirc_data)));
+    if (qrCode == nullptr || qrData == nullptr) {
+        free(qrCode);
+        free(qrData);
+        quirc_destroy(q);
+        endStackChanCamera();
+        gVisual.resumeDrawing();
+        return false;
+    }
+
+    String foundSsid;
+    String foundPassword;
+    bool scannedOk = false;
+
+    uint32_t startedAt = millis();
+    uint32_t allowExitTouchAt = startedAt + 1000;
+    while (!scannedOk && millis() - startedAt < 90000) {
+        M5StackChan.update();
+        if (millis() >= allowExitTouchAt) {
+            if (rawTopTouchActive()) {
+                logLine("WiFi QR camera cancelled via top touch");
+                break;
+            }
+            if (M5.Touch.getCount() > 0 && M5.Touch.getDetail(0).wasPressed()) {
+                logLine("WiFi QR camera cancelled via screen touch");
+                break;
+            }
+        }
+
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (fb == nullptr) {
+            delay(20);
+            continue;
+        }
+
+        if (fb->format == PIXFORMAT_RGB565 && fb->width == 320 && fb->height == 240) {
+            int qw = 0;
+            int qh = 0;
+            uint8_t* gray = quirc_begin(q, &qw, &qh);
+            if (gray != nullptr && qw == 320 && qh == 240) {
+                const uint8_t* src = fb->buf;
+                const size_t totalPixels = 320 * 240;
+                for (size_t idx = 0; idx < totalPixels; ++idx) {
+                    uint8_t b0 = src[idx * 2];
+                    uint8_t b1 = src[idx * 2 + 1];
+                    uint8_t r8 = b0 & 0xF8;
+                    uint8_t g8 = static_cast<uint8_t>(((b0 & 0x07) << 5) | ((b1 & 0xE0) >> 3));
+                    uint8_t b8 = static_cast<uint8_t>((b1 & 0x1F) << 3);
+                    gray[idx] = static_cast<uint8_t>((r8 * 77U + g8 * 150U + b8 * 29U) >> 8);
+                }
+                quirc_end(q);
+            }
+
+            display.pushImage(0, 0, 320, 240, reinterpret_cast<uint16_t*>(fb->buf));
+
+            // Viewfinder & HUD overlay
+            display.fillRect(0, 0, 320, 24, rgb565(12, 18, 28));
+            display.setTextColor(rgb565(80, 220, 255), rgb565(12, 18, 28));
+            display.setCursor(16, 8);
+            display.print("MUESTRAME EL QR WIFI DE TU MOVIL");
+
+            display.drawRect(60, 32, 200, 176, rgb565(80, 255, 120));
+            display.drawRect(61, 33, 198, 174, rgb565(80, 255, 120));
+
+            display.fillRect(0, 216, 320, 24, rgb565(12, 18, 28));
+            display.setTextColor(rgb565(220, 220, 220), rgb565(12, 18, 28));
+            display.setCursor(32, 224);
+            display.print("Toca pantalla o cabeza para salir");
+        }
+
+        esp_camera_fb_return(fb);
+
+        int count = quirc_count(q);
+        for (int i = 0; i < count; ++i) {
+            quirc_extract(q, i, qrCode);
+            quirc_decode_error_t err = quirc_decode(qrCode, qrData);
+            if (err == QUIRC_ERROR_DATA_ECC || err == QUIRC_ERROR_FORMAT_ECC) {
+                quirc_flip(qrCode);
+                err = quirc_decode(qrCode, qrData);
+            }
+            if (err == QUIRC_SUCCESS && qrData->payload_len > 0) {
+                String payload(reinterpret_cast<const char*>(qrData->payload));
+                logLine(String("QR decoded: ") + payload);
+                if (parseWifiPayloadString(payload, foundSsid, foundPassword)) {
+                    scannedOk = true;
+                    break;
+                }
+            }
+        }
+
+        delay(10);
+    }
+
+    free(qrCode);
+    free(qrData);
+    quirc_destroy(q);
+    endStackChanCamera();
+
+    bool connected = false;
+    if (scannedOk && !foundSsid.isEmpty()) {
+        display.fillScreen(rgb565(12, 28, 18));
+        display.setTextColor(rgb565(120, 255, 140), rgb565(12, 28, 18));
+        display.setCursor(20, 80);
+        display.print("QR Wi-Fi detectado!");
+        display.setTextColor(TFT_WHITE, rgb565(12, 28, 18));
+        display.setCursor(20, 108);
+        display.print(String("Red: ") + foundSsid);
+        display.setCursor(20, 136);
+        display.print("Guardando y conectando...");
+
+        if (saveWifiCredentialToSecrets(foundSsid, foundPassword)) {
+            connected = connectWifi(gSecrets.wifiNetworks);
+            if (connected) {
+                requestLocalSfx(LocalSfx::Tada);
+            }
+        }
+    } else {
+        connected = (WiFi.status() == WL_CONNECTED);
+    }
+
+    gVisual.resumeDrawing();
+    setRobotState(connected ? VisualState::Idle : VisualState::Error);
+    return connected;
+}
+
 void drawWifiSetupPortalScreen(const char* apSsid, const String& apIp)
 {
     gVisual.suspendDrawingFor(600000);
@@ -4131,7 +4394,7 @@ void drawWifiSetupPortalScreen(const char* apSsid, const String& apIp)
     display.setTextColor(rgb565(80, 220, 255), rgb565(12, 18, 28));
     display.setTextSize(1);
     display.setCursor(10, 10);
-    display.print("CONFIGURAR WIFI - ESCANEA EL QR");
+    display.print("CONFIGURAR WIFI - PORTAL O CAMARA QR");
 
     // White card for QR code
     display.fillRoundRect(8, 30, 152, 152, 6, TFT_WHITE);
@@ -4139,29 +4402,35 @@ void drawWifiSetupPortalScreen(const char* apSsid, const String& apIp)
     display.qrcode(qrPayload.c_str(), 14, 36, 140, 3);
 
     display.setTextColor(TFT_WHITE, rgb565(12, 18, 28));
-    display.setCursor(168, 36);
+    display.setCursor(168, 34);
     display.print("1. Conecta al WiFi:");
     display.setTextColor(rgb565(120, 255, 140), rgb565(12, 18, 28));
-    display.setCursor(168, 52);
+    display.setCursor(168, 48);
     display.print(apSsid);
 
     display.setTextColor(TFT_WHITE, rgb565(12, 18, 28));
-    display.setCursor(168, 78);
+    display.setCursor(168, 68);
     display.print("2. En tu movil abre:");
     display.setTextColor(rgb565(255, 220, 90), rgb565(12, 18, 28));
-    display.setCursor(168, 94);
+    display.setCursor(168, 82);
     display.print(String("http://") + apIp);
 
     display.setTextColor(rgb565(190, 200, 215), rgb565(12, 18, 28));
-    display.setCursor(168, 120);
-    display.print("3. Elige tu red WiFi");
-    display.setCursor(168, 134);
-    display.print("   y guarda la clave.");
+    display.setCursor(168, 102);
+    display.print("3. O usa la camara");
+    display.setCursor(168, 114);
+    display.print("   de Mika:");
+
+    // Camera QR button
+    display.fillRoundRect(168, 138, 142, 38, 6, rgb565(24, 130, 180));
+    display.setTextColor(TFT_WHITE, rgb565(24, 130, 180));
+    display.setCursor(184, 153);
+    display.print("LEER QR CAMARA");
 
     // Exit button
-    display.fillRoundRect(168, 190, 142, 38, 6, rgb565(180, 50, 50));
+    display.fillRoundRect(168, 188, 142, 38, 6, rgb565(180, 50, 50));
     display.setTextColor(TFT_WHITE, rgb565(180, 50, 50));
-    display.setCursor(192, 205);
+    display.setCursor(192, 203);
     display.print("SALIR / CANCELAR");
 
     display.setTextColor(rgb565(140, 160, 180), rgb565(12, 18, 28));
@@ -4271,7 +4540,8 @@ bool runWifiSetupPortal()
 
     uint32_t startedAt = millis();
     uint32_t allowExitTouchAt = startedAt + 1200;
-    while (!savedAndReady && millis() - startedAt < 300000) {
+    bool switchToCameraQr = false;
+    while (!savedAndReady && !switchToCameraQr && millis() - startedAt < 300000) {
         dnsServer.processNextRequest();
         server.handleClient();
         M5StackChan.update();
@@ -4283,6 +4553,11 @@ bool runWifiSetupPortal()
             }
             if (M5.Touch.getCount() > 0) {
                 const auto& t = M5.Touch.getDetail(0);
+                if (t.wasPressed() && t.x >= 165 && t.y >= 135 && t.y < 185) {
+                    logLine("WiFi portal switching to Camera QR scanner");
+                    switchToCameraQr = true;
+                    break;
+                }
                 if (t.wasPressed() && t.x >= 165 && t.y >= 185) {
                     logLine("WiFi portal cancelled via screen button");
                     break;
@@ -4297,6 +4572,10 @@ bool runWifiSetupPortal()
     dnsServer.stop();
     WiFi.softAPdisconnect(true);
     WiFi.mode(WIFI_STA);
+
+    if (switchToCameraQr) {
+        return runWifiCameraQrScanner();
+    }
 
     bool connected = false;
     if (savedAndReady) {
