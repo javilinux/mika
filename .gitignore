@@ -1,6 +1,8 @@
 # Local credentials and runtime cache
 config/*.local.json
 data/secrets.json
+esphome/secrets.yaml
+esphome/.esphome/
 backups/
 cache/
 generated/

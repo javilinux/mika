@@ -8,6 +8,10 @@ El entorno ya está preparado en el Mac:
   - Aplicación gráfica instalada en `/Applications/M5Burner.app` (con permisos de Gatekeeper liberados).
   - Herramienta CLI en `tools/m5burner_cli.py` para listar y descargar firmwares de M5Burner desde terminal sin abrir la interfaz gráfica.
   - Firmware oficial de fábrica (`StackChan-UserDemo_V1.5.1.bin`) descargado en `backups/firmwares/`.
+- **ESPHome (Integración con Home Assistant):**
+  - `esphome` instalado en macOS (`/opt/homebrew/bin/esphome`).
+  - Configuración oficial de StackChan K151 en `esphome/stackchan.yaml` vinculada a `m5stack/esphome-yaml` (`examples/kit/stackchan-bsp.factory.yaml`).
+  - Generador automático de secretos desde `config/secrets.local.json` en `tools/prepare_esphome_secrets.py`.
 - **Herramientas de Audio:** `ffmpeg` y `sox` instalados globalmente (`/opt/homebrew/bin/`).
 - **Dispositivo USB:** `/dev/cu.usbmodem1201` (CoreS3 con ESP32-S3, 16 MB Flash, 8 MB PSRAM).
 
@@ -47,6 +51,11 @@ python3 tools/m5burner_cli.py download "ESP-Claw For CoreS3"
 
 # Flashear el firmware oficial de fábrica de StackChan (V1.5.1)
 make flash-factory
+
+# Compilar o flashear ESPHome (para integrar con Home Assistant en martiricos)
+make esphome-compile
+make esphome-flash
+make esphome-ota
 ```
 
 ## 3. Conversión de audios nuevos al formato del robot

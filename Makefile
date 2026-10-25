@@ -53,3 +53,16 @@ m5burner-list:
 flash-factory:
 	$(ESPTOOL) --chip esp32s3 --port $(PORT) --baud 921600 write-flash 0x0 backups/firmwares/StackChan-UserDemo_V1.5.1.bin
 
+esphome-compile:
+	$(PYTHON) tools/prepare_esphome_secrets.py
+	esphome compile esphome/stackchan.yaml
+
+esphome-flash:
+	$(PYTHON) tools/prepare_esphome_secrets.py
+	esphome run esphome/stackchan.yaml --device $(PORT)
+
+esphome-ota:
+	$(PYTHON) tools/prepare_esphome_secrets.py
+	esphome run esphome/stackchan.yaml --device m5stack-stackchan.local
+
+
