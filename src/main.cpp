@@ -1,10 +1,12 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <DNSServer.h>
 #include <HTTPClient.h>
 #include <LittleFS.h>
 #include <M5StackChan.h>
 #include <M5UnitUnified.h>
 #include <M5UnitUnifiedNFC.h>
+#include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <algorithm>
@@ -1818,6 +1820,8 @@ void processImuReactions();
 bool reloadRuntimeConfigFromRemote();
 void closeHotLiveSession(const char* reason);
 void serviceHotLiveSession();
+bool runWifiSetupPortal();
+bool saveWifiCredentialToSecrets(const String& ssid, const String& password);
 bool handleScreenMouthTouch(uint32_t now);
 bool maybeTriggerPalomaEasterEgg(String text);
 bool maybeTriggerComplimentEasterEgg(String text);
@@ -1936,8 +1940,14 @@ bool handleScreenCheekTouch(uint32_t now)
     const int16_t height = M5StackChan.Display().height();
 
     if (touch.wasClicked() && touch.getClickCount() >= 2) {
-        const bool reloadZone = touch.y <= height / 4;
-        if (reloadZone) {
+        const bool topZone = touch.y <= height / 4;
+        if (topZone && touch.x < width / 3) {
+            gNextScreenCheekTouchAllowedAt = now + 1500;
+            logLine("Screen WiFi setup portal requested");
+            runWifiSetupPortal();
+            return true;
+        }
+        if (topZone) {
             gNextScreenCheekTouchAllowedAt = now + 1500;
             logLine("Screen config reload");
             if (reloadRuntimeConfigFromRemote()) {
@@ -3944,6 +3954,7 @@ bool loadSecrets(Secrets& secrets)
 
     secrets.geminiApiKey = doc["gemini_api_key"] | "";
     secrets.configCsvUrl = doc["config_csv_url"] | "";
+    secrets.wifiNetworks.clear();
 
     JsonArray networks = doc["wifi_networks"].as<JsonArray>();
     for (JsonObject item : networks) {
@@ -4054,6 +4065,257 @@ bool connectWifi(const std::vector<WifiNetwork>& networks)
 
     logLine("FAIL WiFi");
     return false;
+}
+
+bool saveWifiCredentialToSecrets(const String& ssid, const String& password)
+{
+    String cleanSsid = ssid;
+    cleanSsid.trim();
+    if (cleanSsid.isEmpty()) {
+        return false;
+    }
+
+    JsonDocument doc;
+    File inFile = LittleFS.open(kSecretsPath, "r");
+    if (inFile) {
+        deserializeJson(doc, inFile);
+        inFile.close();
+    }
+
+    doc["wifi_ssid"] = cleanSsid;
+    doc["wifi_password"] = password;
+
+    JsonArray networks = doc["wifi_networks"].is<JsonArray>()
+                             ? doc["wifi_networks"].as<JsonArray>()
+                             : doc["wifi_networks"].to<JsonArray>();
+
+    bool updatedExisting = false;
+    for (JsonObject item : networks) {
+        int prio = item["priority"] | 100;
+        if (String(item["ssid"] | "") == cleanSsid) {
+            item["password"] = password;
+            item["auth"] = password.isEmpty() ? "open" : "wpa";
+            item["priority"] = 5;
+            updatedExisting = true;
+        } else if (prio < 50) {
+            item["priority"] = prio + 10;
+        }
+    }
+
+    if (!updatedExisting) {
+        JsonObject added = networks.add<JsonObject>();
+        added["ssid"] = cleanSsid;
+        added["password"] = password;
+        added["auth"] = password.isEmpty() ? "open" : "wpa";
+        added["priority"] = 5;
+    }
+
+    File outFile = LittleFS.open(kSecretsPath, "w");
+    if (!outFile) {
+        logLine("FAIL write secrets.json");
+        return false;
+    }
+    serializeJsonPretty(doc, outFile);
+    outFile.close();
+
+    logLine(String("OK saved WiFi to secrets.json: ") + cleanSsid);
+    return loadSecrets(gSecrets);
+}
+
+void drawWifiSetupPortalScreen(const char* apSsid, const String& apIp)
+{
+    gVisual.suspendDrawingFor(600000);
+    auto& display = M5StackChan.Display();
+    display.fillScreen(rgb565(12, 18, 28));
+
+    display.setTextColor(rgb565(80, 220, 255), rgb565(12, 18, 28));
+    display.setTextSize(1);
+    display.setCursor(10, 10);
+    display.print("CONFIGURAR WIFI - ESCANEA EL QR");
+
+    // White card for QR code
+    display.fillRoundRect(8, 30, 152, 152, 6, TFT_WHITE);
+    String qrPayload = String("WIFI:T:nopass;S:") + apSsid + ";;";
+    display.qrcode(qrPayload.c_str(), 14, 36, 140, 3);
+
+    display.setTextColor(TFT_WHITE, rgb565(12, 18, 28));
+    display.setCursor(168, 36);
+    display.print("1. Conecta al WiFi:");
+    display.setTextColor(rgb565(120, 255, 140), rgb565(12, 18, 28));
+    display.setCursor(168, 52);
+    display.print(apSsid);
+
+    display.setTextColor(TFT_WHITE, rgb565(12, 18, 28));
+    display.setCursor(168, 78);
+    display.print("2. En tu movil abre:");
+    display.setTextColor(rgb565(255, 220, 90), rgb565(12, 18, 28));
+    display.setCursor(168, 94);
+    display.print(String("http://") + apIp);
+
+    display.setTextColor(rgb565(190, 200, 215), rgb565(12, 18, 28));
+    display.setCursor(168, 120);
+    display.print("3. Elige tu red WiFi");
+    display.setCursor(168, 134);
+    display.print("   y guarda la clave.");
+
+    // Exit button
+    display.fillRoundRect(168, 190, 142, 38, 6, rgb565(180, 50, 50));
+    display.setTextColor(TFT_WHITE, rgb565(180, 50, 50));
+    display.setCursor(192, 205);
+    display.print("SALIR / CANCELAR");
+
+    display.setTextColor(rgb565(140, 160, 180), rgb565(12, 18, 28));
+    display.setCursor(10, 202);
+    display.print("O toca cabeza arriba");
+}
+
+bool runWifiSetupPortal()
+{
+    constexpr const char* kApSsid = "Mika-Setup";
+    logLine("Starting WiFi Setup Portal...");
+    setStatusColor(0, 24, 40);
+
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.disconnect(false, false);
+    delay(200);
+
+    std::vector<String> scannedSsids;
+    std::vector<int32_t> scannedRssi;
+    int n = WiFi.scanNetworks(false, true);
+    for (int i = 0; i < n && i < 20; ++i) {
+        String s = WiFi.SSID(i);
+        if (!s.isEmpty() && std::find(scannedSsids.begin(), scannedSsids.end(), s) == scannedSsids.end()) {
+            scannedSsids.push_back(s);
+            scannedRssi.push_back(WiFi.RSSI(i));
+        }
+    }
+    WiFi.scanDelete();
+
+    WiFi.softAP(kApSsid);
+    delay(200);
+    IPAddress apIp = WiFi.softAPIP();
+    String apIpStr = apIp.toString();
+    logLine(String("AP started: ") + kApSsid + " IP=" + apIpStr);
+
+    DNSServer dnsServer;
+    dnsServer.start(53, "*", apIp);
+
+    WebServer server(80);
+    bool savedAndReady = false;
+
+    auto sendPortalPage = [&]() {
+        String html =
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>Mika Wi-Fi Setup</title>"
+            "<style>"
+            "body{font-family:-apple-system,sans-serif;background:#0d131d;color:#eef2f7;margin:0;padding:20px;}"
+            ".card{max-width:420px;margin:0 auto;background:#162030;border-radius:14px;padding:20px;box-shadow:0 8px 24px rgba(0,0,0,.4);}"
+            "h2{margin-top:0;color:#4fd1ff;}"
+            "label{display:block;margin:12px 0 6px;font-size:14px;color:#a8b8cc;}"
+            "input[type=text],input[type=password]{width:100%;box-sizing:border-box;padding:12px;border-radius:8px;border:1px solid #2e4057;background:#0d131d;color:#fff;font-size:16px;}"
+            "button{width:100%;margin-top:18px;padding:14px;border:0;border-radius:10px;background:#22c55e;color:#052e16;font-size:16px;font-weight:700;cursor:pointer;}"
+            ".net-list{max-height:190px;overflow-y:auto;margin:8px 0;border:1px solid #26354a;border-radius:8px;}"
+            ".net{padding:10px 12px;border-bottom:1px solid #1f2d40;cursor:pointer;display:flex;justify-content:space-between;}"
+            ".net:hover{background:#1f3047;}"
+            "</style></head><body><div class='card'>"
+            "<h2>🤖 Configurar Wi-Fi de Mika</h2>"
+            "<label>Redes Wi-Fi detectadas (toca una):</label><div class='net-list'>";
+        for (size_t i = 0; i < scannedSsids.size(); ++i) {
+            String escaped = scannedSsids[i];
+            escaped.replace("'", "\\'");
+            escaped.replace("\"", "&quot;");
+            html += "<div class='net' onclick=\"document.getElementById('ssid').value='" + escaped + "'\"><span>" +
+                    scannedSsids[i] + "</span><small>" + String(scannedRssi[i]) + " dBm</small></div>";
+        }
+        if (scannedSsids.empty()) {
+            html += "<div class='net'><span>Escribe el nombre manualmente abajo</span></div>";
+        }
+        html +=
+            "</div><form method='POST' action='/save'>"
+            "<label>Nombre de la red (SSID):</label>"
+            "<input id='ssid' name='ssid' type='text' required placeholder='Nombre de tu Wi-Fi'>"
+            "<label>Contraseña:</label>"
+            "<input id='pwd' name='password' type='password' placeholder='Contraseña (vacío si es abierta)'>"
+            "<label style='font-size:13px;margin-top:8px'><input type='checkbox' onchange=\"document.getElementById('pwd').type=this.checked?'text':'password'\"> Mostrar contraseña</label>"
+            "<button type='submit'>Guardar y Conectar</button>"
+            "</form></div></body></html>";
+        server.send(200, "text/html; charset=utf-8", html);
+    };
+
+    server.on("/", HTTP_GET, sendPortalPage);
+    server.on("/generate_204", HTTP_GET, sendPortalPage);
+    server.on("/hotspot-detect.html", HTTP_GET, sendPortalPage);
+    server.on("/ncsi.txt", HTTP_GET, sendPortalPage);
+    server.onNotFound(sendPortalPage);
+
+    server.on("/save", HTTP_POST, [&]() {
+        String ssid = server.arg("ssid");
+        String password = server.arg("password");
+        if (saveWifiCredentialToSecrets(ssid, password)) {
+            server.send(
+                200,
+                "text/html; charset=utf-8",
+                "<!DOCTYPE html><html><body style='font-family:sans-serif;background:#0d131d;color:#fff;text-align:center;padding:40px'>"
+                "<h2 style='color:#22c55e'>✅ ¡Wi-Fi Guardada!</h2>"
+                "<p>Mika se está conectando a <b>" +
+                    ssid + "</b>...</p></body></html>");
+            savedAndReady = true;
+        } else {
+            server.send(400, "text/plain", "Error guardando Wi-Fi");
+        }
+    });
+
+    server.begin();
+    drawWifiSetupPortalScreen(kApSsid, apIpStr);
+
+    uint32_t startedAt = millis();
+    uint32_t allowExitTouchAt = startedAt + 1200;
+    while (!savedAndReady && millis() - startedAt < 300000) {
+        dnsServer.processNextRequest();
+        server.handleClient();
+        M5StackChan.update();
+
+        if (millis() >= allowExitTouchAt) {
+            if (rawTopTouchActive()) {
+                logLine("WiFi portal cancelled via top touch");
+                break;
+            }
+            if (M5.Touch.getCount() > 0) {
+                const auto& t = M5.Touch.getDetail(0);
+                if (t.wasPressed() && t.x >= 165 && t.y >= 185) {
+                    logLine("WiFi portal cancelled via screen button");
+                    break;
+                }
+            }
+        }
+        delay(10);
+    }
+
+    delay(400);
+    server.stop();
+    dnsServer.stop();
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+
+    bool connected = false;
+    if (savedAndReady) {
+        auto& display = M5StackChan.Display();
+        display.fillScreen(rgb565(12, 18, 28));
+        display.setTextColor(rgb565(120, 255, 140), rgb565(12, 18, 28));
+        display.setCursor(30, 110);
+        display.print("Conectando a la nueva Wi-Fi...");
+        connected = connectWifi(gSecrets.wifiNetworks);
+        if (connected) {
+            requestLocalSfx(LocalSfx::Tada);
+        }
+    } else {
+        connected = (WiFi.status() == WL_CONNECTED) || connectWifi(gSecrets.wifiNetworks);
+    }
+
+    gVisual.resumeDrawing();
+    setRobotState(connected ? VisualState::Idle : VisualState::Error);
+    return connected;
 }
 
 bool syncClock()
@@ -6978,9 +7240,11 @@ void setup()
     }
 
     if (!connectWifi(gSecrets.wifiNetworks)) {
-        setRobotState(VisualState::Error);
-        setStatusColor(40, 0, 0);
-        return;
+        if (!runWifiSetupPortal()) {
+            setRobotState(VisualState::Error);
+            setStatusColor(40, 0, 0);
+            return;
+        }
     }
 
     if (!syncClock()) {

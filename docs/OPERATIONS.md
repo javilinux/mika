@@ -66,7 +66,7 @@ Para añadir nuevos efectos de sonido (de Telegram, WhatsApp, MP3 o WAV) al banc
 make fs
 ```
 
-## 4. Configuración y secretos (`config/secrets.local.json`)
+## 4. Configuración y secretos (`config/secrets.local.json`) y Portal Wi-Fi con QR
 La configuración activa del dispositivo se gestiona en `config/secrets.local.json` (ignorado por Git):
 - `wifi_ssid`: SSID de la red Wi-Fi principal
 - `wifi_password`: Contraseña de la red
@@ -74,10 +74,19 @@ La configuración activa del dispositivo se gestiona en `config/secrets.local.js
 - `gemini_api_key`: Clave de API de Gemini
 - `config_csv_url`: URL del CSV de prompts y configuración
 
-Para regenerar y subir `data/secrets.json`:
+Para regenerar y subir `data/secrets.json` por USB:
 ```bash
 make fs
 ```
+
+### Cambiar la Wi-Fi sin cables (Paso 2.1: Portal Cautivo + QR)
+- **Activación automática:** Si al encender el robot ninguna de las redes guardadas está disponible, Mika arranca automáticamente el punto de acceso **`Mika-Setup`** y muestra un **código QR** en pantalla.
+- **Activación manual en cualquier momento:** Haz **doble toque en la esquina superior izquierda** de la pantalla mientras Mika está en reposo (`Idle`).
+- **Proceso desde el móvil:**
+  1. Escanea el QR de la pantalla (te conecta a la Wi-Fi `Mika-Setup`).
+  2. Se abrirá el portal cautivo (o entra en `http://192.168.4.1`).
+  3. Toca una de las redes detectadas, escribe la contraseña y pulsa **Guardar y Conectar**.
+  4. La nueva red queda guardada con máxima prioridad en `/secrets.json` dentro de `LittleFS`.
 
 ## 5. Notas sobre compatibilidad y drivers (ESP-IDF v5 / Arduino 3.x)
 - **M5Unified:** Fijada en `platformio.ini` a `0.2.14` para evitar roturas de API en `PY32IOExpander`.
